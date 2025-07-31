@@ -38,12 +38,14 @@ class BiSO101Leader(Teleoperator):
             id=f"{config.id}_left" if config.id else None,
             calibration_dir=config.calibration_dir,
             port=config.left_arm_port,
+            filter_motors=config.left_arm_filter_motors,
         )
 
         right_arm_config = SO101LeaderConfig(
             id=f"{config.id}_right" if config.id else None,
             calibration_dir=config.calibration_dir,
             port=config.right_arm_port,
+            filter_motors=config.right_arm_filter_motors,
         )
 
         self.left_arm = SO101Leader(left_arm_config)

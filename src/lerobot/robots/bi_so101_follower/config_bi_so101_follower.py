@@ -37,3 +37,7 @@ class BiSO101FollowerConfig(RobotConfig):
 
     # cameras (shared between both arms)
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
+
+    # filter_motors
+    left_arm_filter_motors: list[int] = field(default_factory=list)
+    right_arm_filter_motors: list[int] = field(default_factory=list)
