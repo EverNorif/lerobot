@@ -42,16 +42,20 @@ class SO101Leader(Teleoperator):
         super().__init__(config)
         self.config = config
         norm_mode_body = MotorNormMode.DEGREES if config.use_degrees else MotorNormMode.RANGE_M100_100
+        all_motors = [
+            (1, "shoulder_pan", Motor(1, "sts3215", norm_mode_body)),
+            (2, "shoulder_lift", Motor(2, "sts3215", norm_mode_body)),
+            (3, "elbow_flex", Motor(3, "sts3215", norm_mode_body)),
+            (4, "wrist_flex", Motor(4, "sts3215", norm_mode_body)),
+            (5, "wrist_roll", Motor(5, "sts3215", norm_mode_body)),
+            (6, "gripper", Motor(6, "sts3215", MotorNormMode.RANGE_0_100)),
+        ]
+        used_motors = {
+            motor_name: motor for (motor_id, motor_name, motor) in all_motors if motor_id not in config.filter_motors
+        }
         self.bus = FeetechMotorsBus(
             port=self.config.port,
-            motors={
-                "shoulder_pan": Motor(1, "sts3215", norm_mode_body),
-                "shoulder_lift": Motor(2, "sts3215", norm_mode_body),
-                "elbow_flex": Motor(3, "sts3215", norm_mode_body),
-                "wrist_flex": Motor(4, "sts3215", norm_mode_body),
-                "wrist_roll": Motor(5, "sts3215", norm_mode_body),
-                "gripper": Motor(6, "sts3215", MotorNormMode.RANGE_0_100),
-            },
+            motors=used_motors,
             calibration=self.calibration,
         )
 

@@ -19,12 +19,11 @@ from dataclasses import dataclass, field
 from ..config import TeleoperatorConfig
 
 
-@TeleoperatorConfig.register_subclass("so101_leader")
+@TeleoperatorConfig.register_subclass("bi_so101_leader")
 @dataclass
-class SO101LeaderConfig(TeleoperatorConfig):
-    # Port to connect to the arm
-    port: str
+class BiSO101LeaderConfig(TeleoperatorConfig):
+    left_arm_port: str
+    right_arm_port: str
 
-    use_degrees: bool = False
-
-    filter_motors: list[int] = field(default_factory=list)
+    left_arm_filter_motors: list[int] = field(default_factory=list)
+    right_arm_filter_motors: list[int] = field(default_factory=list)

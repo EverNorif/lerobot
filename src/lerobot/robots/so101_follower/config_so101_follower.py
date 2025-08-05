@@ -39,3 +39,7 @@ class SO101FollowerConfig(RobotConfig):
 
     # Set to `True` for backward compatibility with previous policies/dataset
     use_degrees: bool = False
+
+    # Set the motor IDs should be filtered out from the robot.
+    # If not set, the default is an empty list, and will use all motors[1, 2, 3, 4, 5, 6]
+    filter_motors: list[int] = field(default_factory=list)

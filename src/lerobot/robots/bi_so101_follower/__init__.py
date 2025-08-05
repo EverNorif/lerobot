@@ -14,17 +14,5 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass, field
-
-from ..config import TeleoperatorConfig
-
-
-@TeleoperatorConfig.register_subclass("so101_leader")
-@dataclass
-class SO101LeaderConfig(TeleoperatorConfig):
-    # Port to connect to the arm
-    port: str
-
-    use_degrees: bool = False
-
-    filter_motors: list[int] = field(default_factory=list)
+from .bi_so101_follower import BiSO101Follower
+from .config_bi_so101_follower import BiSO101FollowerConfig
