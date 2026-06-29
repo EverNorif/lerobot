@@ -150,6 +150,24 @@ def update_policy(
     return train_metrics, output_dict
 
 
+def make_dataset_weighted_sampler(dataset, sample_weights: list[float]) -> torch.utils.data.WeightedRandomSampler:
+    if not hasattr(dataset, "_datasets"):
+        raise ValueError("dataset.sample_weights can only be used with multiple datasets.")
+    if len(sample_weights) != len(dataset._datasets):
+        raise ValueError(
+            "dataset.sample_weights must have the same length as dataset.repo_id. "
+            f"Got {len(sample_weights)} weights for {len(dataset._datasets)} datasets."
+        )
+
+    weights = []
+    for sample_weight, sub_dataset in zip(sample_weights, dataset._datasets, strict=True):
+        if len(sub_dataset) == 0:
+            raise ValueError(f"Cannot sample from empty dataset '{sub_dataset.repo_id}'.")
+        weights.extend([sample_weight / len(sub_dataset)] * len(sub_dataset))
+
+    return torch.utils.data.WeightedRandomSampler(weights, num_samples=len(dataset), replacement=True)
+
+
 @parser.wrap()
 def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     """
@@ -355,7 +373,14 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
     # create dataloader for offline training
-    if hasattr(cfg.policy, "drop_n_last_frames"):
+    if cfg.dataset.sample_weights is not None:
+        if hasattr(cfg.policy, "drop_n_last_frames"):
+            raise NotImplementedError(
+                "dataset.sample_weights is not supported with policies that require drop_n_last_frames."
+            )
+        shuffle = False
+        sampler = make_dataset_weighted_sampler(dataset, cfg.dataset.sample_weights)
+    elif hasattr(cfg.policy, "drop_n_last_frames"):
         shuffle = False
         sampler = EpisodeAwareSampler(
             dataset.meta.episodes["dataset_from_index"],

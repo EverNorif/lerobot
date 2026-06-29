@@ -46,6 +46,7 @@ from lerobot.datasets.video_utils import VALID_VIDEO_CODECS
 from lerobot.envs.factory import make_env_config
 from lerobot.policies.factory import make_policy_config
 from lerobot.robots import make_robot_from_config
+from lerobot.scripts.lerobot_train import make_dataset_weighted_sampler
 from lerobot.utils.constants import ACTION, DONE, OBS_IMAGES, OBS_STATE, OBS_STR, REWARD
 from tests.fixtures.constants import DUMMY_CHW, DUMMY_HWC, DUMMY_REPO_ID
 from tests.mocks.mock_robot import MockRobotConfig
@@ -411,6 +412,96 @@ def test_multilerobot_dataset_set_image_transforms_propagates(tmp_path, lerobot_
     dataset.clear_image_transforms()
     assert dataset.image_transforms is None
     assert all(child.image_transforms is None for child in dataset._datasets)
+
+
+def test_multilerobot_dataset_weighted_sampler(tmp_path, lerobot_dataset_factory):
+    root = tmp_path / "multi"
+    repo_ids = ["lerobot/test_multi_a", "lerobot/test_multi_b"]
+    total_frames = [10, 30]
+
+    for repo_id, num_frames in zip(repo_ids, total_frames, strict=True):
+        lerobot_dataset_factory(
+            root=root / repo_id,
+            repo_id=repo_id,
+            total_episodes=1,
+            total_frames=num_frames,
+            use_videos=False,
+        )
+
+    dataset = MultiLeRobotDataset(repo_ids, root=root, download_videos=False)
+    sampler = make_dataset_weighted_sampler(dataset, [0.7, 0.3])
+
+    assert sampler.num_samples == len(dataset)
+    weights = sampler.weights.tolist()
+    assert weights[:10] == pytest.approx([0.7 / 10] * 10)
+    assert weights[10:] == pytest.approx([0.3 / 30] * 30)
+
+
+def test_multilerobot_dataset_resizes_camera_shapes_with_padding(tmp_path, lerobot_dataset_factory, info_factory):
+    root = tmp_path / "multi"
+    repo_ids = ["lerobot/test_multi_a", "lerobot/test_multi_b"]
+    camera_features = [
+        {"laptop": {"shape": (64, 96, 3), "names": ["height", "width", "channels"], "info": None}},
+        {"laptop": {"shape": (48, 96, 3), "names": ["height", "width", "channels"], "info": None}},
+    ]
+
+    for repo_id, cameras in zip(repo_ids, camera_features, strict=True):
+        info = info_factory(total_episodes=1, total_frames=1, use_videos=False, camera_features=cameras)
+        lerobot_dataset_factory(
+            root=root / repo_id,
+            repo_id=repo_id,
+            total_episodes=1,
+            total_frames=1,
+            use_videos=False,
+            info=info,
+        )
+
+    dataset = MultiLeRobotDataset(repo_ids, root=root, download_videos=False)
+
+    assert dataset.meta.features["laptop"]["shape"] == (64, 96, 3)
+    assert dataset[0]["laptop"].shape == torch.Size([3, 64, 96])
+    assert dataset[1]["laptop"].shape == torch.Size([3, 64, 96])
+
+
+def test_multilerobot_dataset_metadata_episode_offsets(tmp_path, lerobot_dataset_factory):
+    root = tmp_path / "multi"
+    repo_ids = ["lerobot/test_multi_a", "lerobot/test_multi_b"]
+    total_frames = [10, 30]
+
+    for repo_id, num_frames in zip(repo_ids, total_frames, strict=True):
+        lerobot_dataset_factory(
+            root=root / repo_id,
+            repo_id=repo_id,
+            total_episodes=1,
+            total_frames=num_frames,
+            use_videos=False,
+        )
+
+    dataset = MultiLeRobotDataset(repo_ids, root=root, download_videos=False)
+
+    assert dataset.meta.total_frames == 40
+    assert dataset.meta.total_episodes == 2
+    assert dataset.meta.episodes["dataset_from_index"] == [0, 10]
+    assert dataset.meta.episodes["dataset_to_index"] == [10, 40]
+
+
+def test_make_dataset_weighted_sampler_rejects_empty_dataset(tmp_path, lerobot_dataset_factory):
+    root = tmp_path / "multi"
+    repo_ids = ["lerobot/test_multi_a", "lerobot/test_multi_b"]
+    total_frames = [10, 0]
+
+    for repo_id, num_frames in zip(repo_ids, total_frames, strict=True):
+        lerobot_dataset_factory(
+            root=root / repo_id,
+            repo_id=repo_id,
+            total_episodes=1,
+            total_frames=num_frames,
+            use_videos=False,
+        )
+
+    dataset = MultiLeRobotDataset(repo_ids, root=root, download_videos=False)
+    with pytest.raises(ValueError, match="empty dataset"):
+        make_dataset_weighted_sampler(dataset, [0.7, 0.3])
 
 
 def test_image_array_to_pil_image_wrong_range_float_0_255():

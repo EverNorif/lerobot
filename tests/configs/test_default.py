@@ -36,3 +36,27 @@ def test_dataset_config_none_episodes_ok():
 
 def test_dataset_config_empty_episodes_ok():
     DatasetConfig(repo_id="user/repo", episodes=[])
+
+
+def test_dataset_config_multi_repo_sample_weights_ok():
+    DatasetConfig(repo_id=["user/repo_a", "user/repo_b"], sample_weights=[0.7, 0.3])
+
+
+def test_dataset_config_sample_weights_require_multi_repo():
+    with pytest.raises(ValueError, match="can only be used"):
+        DatasetConfig(repo_id="user/repo", sample_weights=[1.0])
+
+
+def test_dataset_config_sample_weights_match_repo_count():
+    with pytest.raises(ValueError, match="same length"):
+        DatasetConfig(repo_id=["user/repo_a", "user/repo_b"], sample_weights=[1.0])
+
+
+def test_dataset_config_sample_weights_positive():
+    with pytest.raises(ValueError, match="positive"):
+        DatasetConfig(repo_id=["user/repo_a", "user/repo_b"], sample_weights=[0.7, 0.0])
+
+
+def test_dataset_config_multi_repo_non_empty():
+    with pytest.raises(ValueError, match="At least one"):
+        DatasetConfig(repo_id=[])

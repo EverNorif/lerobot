@@ -26,7 +26,8 @@ class DatasetConfig:
     # keys common between the datasets are kept. Each dataset gets and additional transform that inserts the
     # "dataset_index" into the returned item. The index mapping is made according to the order in which the
     # datasets are provided.
-    repo_id: str
+    repo_id: list[str] | str
+    sample_weights: list[float] | None = None
     # Root directory for a concrete local dataset tree (e.g. 'dataset/path'). If None, local datasets are
     # looked up under $HF_LEROBOT_HOME/repo_id and Hub downloads use a revision-safe cache under $HF_LEROBOT_HOME/hub.
     root: str | None = None
@@ -38,6 +39,21 @@ class DatasetConfig:
     streaming: bool = False
 
     def __post_init__(self) -> None:
+        if isinstance(self.repo_id, list):
+            if len(self.repo_id) == 0:
+                raise ValueError("At least one dataset repo_id must be provided.")
+        elif self.sample_weights is not None:
+            raise ValueError("dataset.sample_weights can only be used when dataset.repo_id is a list.")
+
+        if self.sample_weights is not None:
+            if len(self.sample_weights) != len(self.repo_id):
+                raise ValueError(
+                    "dataset.sample_weights must have the same length as dataset.repo_id. "
+                    f"Got {len(self.sample_weights)} weights for {len(self.repo_id)} datasets."
+                )
+            if any(weight <= 0 for weight in self.sample_weights):
+                raise ValueError(f"dataset.sample_weights must be positive, got: {self.sample_weights}")
+
         if self.episodes is not None:
             if any(ep < 0 for ep in self.episodes):
                 raise ValueError(

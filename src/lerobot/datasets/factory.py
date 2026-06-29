@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+from pathlib import Path
 from pprint import pformat
 
 import torch
@@ -110,11 +111,21 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 tolerance_s=cfg.tolerance_s,
             )
     else:
-        raise NotImplementedError("The MultiLeRobotDataset isn't supported for now.")
+        if cfg.dataset.streaming:
+            raise NotImplementedError("Streaming is not supported for multiple LeRobot datasets.")
+        if cfg.dataset.episodes is not None:
+            raise NotImplementedError("Episode filtering is not supported for multiple LeRobot datasets yet.")
+        ds_meta_root = Path(cfg.dataset.root) / cfg.dataset.repo_id[0] if cfg.dataset.root else None
+        ds_meta = LeRobotDatasetMetadata(
+            cfg.dataset.repo_id[0], root=ds_meta_root, revision=cfg.dataset.revision
+        )
+        delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
         dataset = MultiLeRobotDataset(
             cfg.dataset.repo_id,
-            # TODO(aliberts): add proper support for multi dataset
-            # delta_timestamps=delta_timestamps,
+            root=cfg.dataset.root,
+            episodes=cfg.dataset.episodes,
+            delta_timestamps=delta_timestamps,
+            tolerances_s=dict.fromkeys(cfg.dataset.repo_id, cfg.tolerance_s),
             image_transforms=image_transforms,
             video_backend=cfg.dataset.video_backend,
         )
