@@ -28,7 +28,9 @@ from tqdm import tqdm
 
 from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
-from lerobot.datasets.factory import make_dataset
+from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
+from lerobot.datasets.factory import IMAGENET_STATS, make_dataset, resolve_delta_timestamps
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.datasets.utils import cycle
 from lerobot.envs.factory import make_env, make_env_pre_post_processors
@@ -245,6 +247,38 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if not is_main_process:
         dataset = make_dataset(cfg)
 
+    # Create validation dataset(s) for computing held-out loss
+    val_datasets = {}
+    if cfg.val_freq > 0 and cfg.val_dataset is not None:
+        if is_main_process:
+            logging.info("Creating validation dataset(s)")
+
+        # Support both single repo_id and list of repo_ids (like training dataset)
+        val_repo_ids = cfg.val_dataset.repo_id if isinstance(cfg.val_dataset.repo_id, list) else [cfg.val_dataset.repo_id]
+
+        for val_repo_id in val_repo_ids:
+            ds_meta = LeRobotDatasetMetadata(
+                val_repo_id, root=cfg.val_dataset.root, revision=cfg.val_dataset.revision
+            )
+            delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
+            val_ds = LeRobotDataset(
+                val_repo_id,
+                root=cfg.val_dataset.root,
+                episodes=cfg.val_dataset.episodes,
+                delta_timestamps=delta_timestamps,
+                image_transforms=None,
+                revision=cfg.val_dataset.revision,
+                video_backend=cfg.val_dataset.video_backend,
+                tolerance_s=cfg.tolerance_s,
+            )
+            if cfg.dataset.use_imagenet_stats:
+                for key in val_ds.meta.camera_keys:
+                    for stats_type, stats in IMAGENET_STATS.items():
+                        val_ds.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
+
+            # Use repo_id as the name for this validation dataset
+            val_datasets[val_repo_id] = val_ds
+
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
     # using the eval.py instead, with gym_dora environment and dora-rs.
@@ -404,12 +438,31 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         prefetch_factor=2 if cfg.num_workers > 0 else None,
     )
 
+    # Create validation dataloader(s)
+    val_dataloaders = {}
+    if val_datasets:
+        for val_name, val_ds in val_datasets.items():
+            val_dl = torch.utils.data.DataLoader(
+                val_ds,
+                num_workers=cfg.num_workers,
+                batch_size=cfg.batch_size,
+                shuffle=True,
+                pin_memory=device.type == "cuda",
+                drop_last=False,
+                prefetch_factor=2 if cfg.num_workers > 0 else None,
+            )
+            val_dataloaders[val_name] = val_dl
+
     # Prepare everything with accelerator
     accelerator.wait_for_everyone()
     policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
         policy, optimizer, dataloader, lr_scheduler
     )
     dl_iter = cycle(dataloader)
+
+    if val_dataloaders:
+        for val_name in val_dataloaders:
+            val_dataloaders[val_name] = accelerator.prepare(val_dataloaders[val_name])
 
     policy.train()
 
@@ -471,6 +524,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
         is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
         is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
+        is_val_step = cfg.val_freq > 0 and step % cfg.val_freq == 0 and val_dataloaders
 
         if is_log_step:
             logging.info(train_tracker)
@@ -510,6 +564,35 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     wandb_logger.log_policy(checkpoint_dir)
 
             accelerator.wait_for_everyone()
+
+        if is_val_step:
+            # Keep policy in train mode for validation to ensure VAE works correctly in ACT
+            # (VAE only computes parameters when self.training=True)
+            # We use torch.no_grad() to prevent gradient computation
+            per_dataset_losses = {}
+            with torch.no_grad():
+                for val_name, val_dl in val_dataloaders.items():
+                    val_losses = []
+                    val_iter = iter(val_dl)
+                    for _ in range(cfg.val_num_batches):
+                        try:
+                            val_batch = next(val_iter)
+                        except StopIteration:
+                            val_iter = iter(val_dl)
+                            val_batch = next(val_iter)
+                        val_batch = preprocessor(val_batch)
+                        loss, _ = policy(val_batch)
+                        val_losses.append(loss.item())
+                    per_dataset_losses[val_name] = sum(val_losses) / len(val_losses)
+
+            avg_val_loss = sum(per_dataset_losses.values()) / len(per_dataset_losses)
+            if is_main_process:
+                parts = "  ".join(f"{name}={loss:.4f}" for name, loss in per_dataset_losses.items())
+                logging.info(f"Step {step} | val_loss: {avg_val_loss:.4f}  ({parts})")
+                if wandb_logger:
+                    log_dict = {"val_loss": avg_val_loss}
+                    log_dict.update({f"val_loss/{name}": loss for name, loss in per_dataset_losses.items()})
+                    wandb_logger.log_dict(log_dict, step, mode="eval")
 
         if cfg.env and is_eval_step:
             if is_main_process:

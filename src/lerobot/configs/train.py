@@ -58,6 +58,9 @@ class TrainPipelineConfig(HubMixin):
     batch_size: int = 8
     steps: int = 100_000
     eval_freq: int = 20_000
+    val_freq: int = 2500
+    val_num_batches: int = 4
+    val_dataset: DatasetConfig | None = None
     log_freq: int = 200
     tolerance_s: float = 1e-4
     save_checkpoint: bool = True
