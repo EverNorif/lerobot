@@ -747,6 +747,109 @@ def concatenate_video_files(
     shutil.move(tmp_output_video_path, output_video_path)
     Path(tmp_concatenate_path).unlink()
 
+def split_video_file(
+    input_video_path: Path | str,
+    output_video_path: Path | str,
+    start_time: float,
+    end_time: float,
+    overwrite: bool = True,
+):
+    """
+    Extract a segment from a video file based on timestamps using pyav.
+
+    This function extracts a portion of a video file from start_time to end_time (in seconds)
+    and saves it to the output path. It uses stream copy mode when possible for fast extraction
+    without re-encoding.
+
+    Args:
+        input_video_path: Path to the input video file.
+        output_video_path: Path to the output video file.
+        start_time: Start time in seconds for the segment to extract.
+        end_time: End time in seconds for the segment to extract.
+        overwrite: Whether to overwrite the output video file if it already exists. Default is True.
+
+    Note:
+        - Uses pyav for video processing with stream copy for efficiency.
+        - Seeks to the nearest keyframe before start_time and copies packets until end_time.
+        - The actual start may be slightly before start_time due to keyframe seeking.
+    """
+    input_video_path = Path(input_video_path)
+    output_video_path = Path(output_video_path)
+
+    if output_video_path.exists() and not overwrite:
+        logger.warning(f"Video file already exists: {output_video_path}. Skipping split.")
+        return
+
+    output_video_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not input_video_path.exists():
+        raise FileNotFoundError(f"Input video file not found: {input_video_path}")
+
+    # Open input container
+    input_container = av.open(str(input_video_path), mode="r")
+
+    # Get the video stream
+    video_stream = input_container.streams.video[0]
+
+    # Create temporary output file
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_named_file:
+        tmp_output_video_path = tmp_named_file.name
+
+    output_container = av.open(
+        tmp_output_video_path, mode="w", options={"movflags": "faststart"}
+    )
+
+    # Replicate input streams in output container
+    stream_map = {}
+    for input_stream in input_container.streams:
+        if input_stream.type in ("video", "audio", "subtitle"):
+            stream_map[input_stream.index] = output_container.add_stream_from_template(
+                template=input_stream, opaque=True
+            )
+            # Set the time base to the input stream time base
+            stream_map[input_stream.index].time_base = input_stream.time_base
+
+    # Convert start_time and end_time to stream time_base units
+    start_pts = int(start_time / float(video_stream.time_base))
+    end_pts = int(end_time / float(video_stream.time_base))
+
+    # Seek to start_time (seeks to nearest keyframe before or at this position)
+    input_container.seek(start_pts, stream=video_stream)
+
+    # Track pts offset for remuxing
+    first_pts = None
+    pts_offset = {}
+
+    # Demux + remux packets within the time range
+    for packet in input_container.demux():
+        # Skip packets from unmapped streams
+        if packet.stream.index not in stream_map:
+            continue
+
+        # Skip demux flushing packets
+        if packet.dts is None or packet.pts is None:
+            continue
+
+        # Check if packet is beyond end_time
+        if packet.pts > end_pts:
+            break
+
+        # Initialize pts offset for this stream on first packet
+        if packet.stream.index not in pts_offset:
+            pts_offset[packet.stream.index] = packet.pts
+
+        # Adjust pts/dts to start from 0 in the output
+        output_stream = stream_map[packet.stream.index]
+        packet.pts -= pts_offset[packet.stream.index]
+        packet.dts -= pts_offset[packet.stream.index]
+        packet.stream = output_stream
+
+        output_container.mux(packet)
+
+    input_container.close()
+    output_container.close()
+    shutil.move(tmp_output_video_path, output_video_path)
+
 
 class _CameraEncoderThread(threading.Thread):
     """A thread that encodes video frames streamed via a queue into an MP4 file.
