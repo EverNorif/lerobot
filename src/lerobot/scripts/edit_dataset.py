@@ -39,6 +39,20 @@ Examples:
             --inputs path/to/ds1 path/to/ds2 \\
             --output path/to/merged \\
             --repo-id user/merged_dataset
+
+    Delete episodes 0 and 3 from a dataset (output to a new dir)::
+
+        lerobot-edit-dataset delete-episodes \\
+            --input path/to/ds \\
+            --episode-indices 0 3 \\
+            --output path/to/trimmed
+
+    Delete episodes in place (original backed up to <ds>_backup_<ts>)::
+
+        lerobot-edit-dataset delete-episodes \\
+            --input path/to/ds \\
+            --episode-indices 0 3 \\
+            --in-place
 """
 
 from __future__ import annotations
@@ -207,9 +221,13 @@ def _rewrite_episode_parquet(
     dst_path: Path,
     new_episode_index: int,
     new_index_start: int,
-    task_index_map: dict[int, int],
+    task_index_map: dict[int, int] | None = None,
 ) -> int:
     """Rewrite a single episode parquet, remapping ``index``/``episode_index``/``task_index``.
+
+    ``task_index_map`` remaps source task_index -> new task_index. If ``None``, the
+    ``task_index`` column is kept unchanged (used by delete_episodes, where the task
+    table is preserved as-is).
 
     Returns the episode length (number of frames).
     """
@@ -226,11 +244,14 @@ def _rewrite_episode_parquet(
         elif name == "episode_index":
             columns.append(new_ep)
         elif name == "task_index":
-            old_col = table.column(name).to_pylist()
-            new_col = pa.array(
-                np.array([task_index_map[int(t)] for t in old_col], dtype=np.int64)
-            )
-            columns.append(new_col)
+            if task_index_map is None:
+                columns.append(table.column(name))
+            else:
+                old_col = table.column(name).to_pylist()
+                new_col = pa.array(
+                    np.array([task_index_map[int(t)] for t in old_col], dtype=np.int64)
+                )
+                columns.append(new_col)
         else:
             columns.append(table.column(name))
 
@@ -480,6 +501,219 @@ def merge_datasets(
     return output
 
 
+# =====================================================================================
+# delete_episodes operation
+# =====================================================================================
+def delete_episodes(
+    input: str | Path,
+    episode_indices: list[int],
+    output: str | Path | None = None,
+    repo_id: str | None = None,
+    in_place: bool = False,
+) -> Path:
+    """Delete episodes from a LeRobot v2.1 dataset, reindexing the survivors 0..N-1.
+
+    Behaviour:
+        - Episodes listed in ``episode_indices`` are removed.
+        - Surviving episodes are re-indexed contiguously from 0 (required by the v2.1
+          format, which derives chunk/parquet/mp4 paths from ``episode_index``).
+        - Per-frame ``index`` (global frame counter) and ``episode_index`` columns are
+          rewritten; ``task_index`` is kept as-is (the task table is preserved, so
+          indices remain valid strings regardless).
+        - ``meta/episodes.jsonl`` / ``episodes_stats.jsonl`` are rebuilt; ``stats.json``
+          is re-aggregated; ``info.json`` counters/splits updated.
+
+    Args:
+        input: Source dataset root directory.
+        episode_indices: Source episode_index values to delete.
+        output: Destination directory (required unless ``in_place``). Must be empty/absent.
+        repo_id: repo_id recorded in the output info.json (default: input's repo_id).
+        in_place: If True, write back into ``input`` (after copying the original aside as
+            a ``<input>_backup_<ts>`` sibling so the operation is reversible). Exclusive
+            with ``output``.
+
+    Returns:
+        The output dataset root path.
+    """
+    import time
+
+    src = Path(input).expanduser().resolve()
+    if not (src / INFO_PATH).is_file():
+        raise FileNotFoundError(f"Input is not a LeRobot dataset (missing {INFO_PATH}): {src}")
+
+    if in_place and output is not None:
+        raise ValueError("Cannot specify both --output and --in-place.")
+    if not in_place and output is None:
+        raise ValueError("Either --output or --in-place must be specified.")
+
+    meta = load_meta(src)
+    v = packaging.version.parse(meta.info["codebase_version"])
+    if v != packaging.version.parse(CODEBASE_VERSION):
+        raise ValueError(
+            f"delete_episodes only supports {CODEBASE_VERSION}; got {meta.info['codebase_version']}."
+        )
+
+    del_set = set(int(i) for i in episode_indices)
+    all_eps = sorted(meta.episodes.keys())
+    for idx in del_set:
+        if idx not in meta.episodes:
+            raise ValueError(
+                f"Episode index {idx} not found in dataset '{meta.repo_id}' "
+                f"(valid: 0..{max(all_eps) if all_eps else -1})."
+            )
+    keep_eps = [e for e in all_eps if e not in del_set]
+    n_total = len(all_eps)
+    n_keep = len(keep_eps)
+    if n_keep == 0:
+        raise ValueError("Refusing to delete every episode (result would be empty).")
+
+    # Resolve output dir.
+    if in_place:
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        backup = src.parent / f"{src.name}_backup_{ts}"
+        if backup.exists():
+            raise FileExistsError(f"Backup path already exists: {backup}")
+        output_root = src
+        # Move original aside, then we will rebuild in_place into a fresh dir and finally
+        # swap. Simplest reversible approach: rename src -> backup, then treat backup as input.
+        shutil.move(str(src), str(backup))
+        source_dir = backup
+        logger.info("Moved original dataset to backup: %s", backup)
+    else:
+        output_root = Path(output).expanduser().resolve()  # type: ignore[arg-type]
+        if output_root.exists() and any(output_root.iterdir()):
+            raise FileExistsError(
+                f"Output directory {output_root} already exists and is not empty."
+            )
+        if output_root == src:
+            raise ValueError("Output path must not equal input path (use --in-place instead).")
+        source_dir = src
+
+    chunks_size = meta.chunks_size
+    data_path_template = meta.info["data_path"]
+    video_path_template = meta.info.get("video_path")
+    video_keys = meta.video_keys
+
+    out_info = copy.deepcopy(meta.info)
+    out_info["repo_id"] = repo_id if repo_id is not None else meta.repo_id
+    out_info["total_episodes"] = 0
+    out_info["total_frames"] = 0
+    out_info["total_videos"] = 0
+    out_info["total_chunks"] = 0
+    out_info["splits"] = {}
+    # total_tasks unchanged: task table preserved as-is.
+
+    output_root.mkdir(parents=True, exist_ok=True)
+    (output_root / "meta").mkdir(parents=True, exist_ok=True)
+
+    # Preserve the task table verbatim.
+    src_tasks_path = source_dir / TASKS_PATH
+    if src_tasks_path.is_file():
+        shutil.copy2(src_tasks_path, output_root / TASKS_PATH)
+
+    episodes_out_path = output_root / EPISODES_PATH
+    episodes_stats_out_path = output_root / EPISODES_STATS_PATH
+
+    src_episodes_stats = load_episodes_stats(source_dir)
+    all_episode_stats: list[dict] = []
+
+    next_ep_index = 0
+    next_global_frame = 0
+
+    logger.info(
+        "Deleting %d episode(s) from '%s': %d -> %d remaining.",
+        len(del_set), meta.repo_id, n_total, n_keep,
+    )
+
+    pbar = tqdm(total=n_keep, unit="ep", desc="delete", dynamic_ncols=True)
+    try:
+        for src_ep_idx in keep_eps:
+            ep_dict = meta.episodes[src_ep_idx]
+            length = ep_dict["length"]
+            ep_task_strs = ep_dict.get("tasks", [])
+
+            # 1. Rewrite parquet (episode_index + index; task_index unchanged).
+            src_pq = source_dir / _format_parquet_path(src_ep_idx, chunks_size, data_path_template)
+            if not src_pq.is_file():
+                raise FileNotFoundError(f"Missing parquet for episode {src_ep_idx}: {src_pq}")
+            dst_pq = output_root / _format_parquet_path(next_ep_index, chunks_size, data_path_template)
+            actual_length = _rewrite_episode_parquet(
+                src_pq, dst_pq,
+                new_episode_index=next_ep_index,
+                new_index_start=next_global_frame,
+                task_index_map=None,
+            )
+            if actual_length != length:
+                logger.warning(
+                    "episode %d: meta length %d != parquet rows %d; using parquet rows.",
+                    src_ep_idx, length, actual_length,
+                )
+                length = actual_length
+
+            # 2. Copy videos.
+            if video_path_template is not None:
+                for vid_key in video_keys:
+                    src_vid = source_dir / _format_video_path(
+                        src_ep_idx, chunks_size, video_path_template, vid_key
+                    )
+                    if not src_vid.is_file():
+                        raise FileNotFoundError(
+                            f"Video missing for episode {src_ep_idx} key {vid_key}: {src_vid}"
+                        )
+                    dst_vid = output_root / _format_video_path(
+                        next_ep_index, chunks_size, video_path_template, vid_key
+                    )
+                    dst_vid.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src_vid, dst_vid)
+
+            # 3. episodes.jsonl
+            append_jsonlines(
+                {"episode_index": next_ep_index, "tasks": list(ep_task_strs), "length": length},
+                episodes_out_path,
+            )
+
+            # 4. episodes_stats.jsonl
+            if src_ep_idx in src_episodes_stats:
+                ep_stats = src_episodes_stats[src_ep_idx]
+                append_jsonlines(
+                    {"episode_index": next_ep_index, "stats": serialize_dict(ep_stats)},
+                    episodes_stats_out_path,
+                )
+                all_episode_stats.append(ep_stats)
+
+            # 5. counters
+            next_ep_index += 1
+            next_global_frame += length
+            out_info["total_episodes"] += 1
+            out_info["total_frames"] += length
+            out_info["total_videos"] += len(video_keys)
+            chunk_now = _episode_chunk(next_ep_index - 1, chunks_size)
+            if chunk_now + 1 > out_info["total_chunks"]:
+                out_info["total_chunks"] = chunk_now + 1
+            out_info["splits"] = {"train": f"0:{out_info['total_episodes']}"}
+
+            pbar.set_postfix(frames=out_info["total_frames"])
+            pbar.update(1)
+    finally:
+        pbar.close()
+
+    write_json(out_info, output_root / INFO_PATH)
+
+    if all_episode_stats:
+        write_stats(aggregate_stats(all_episode_stats), output_root)
+    else:
+        logger.warning("No per-episode stats found; skipping stats.json.")
+
+    _consistency_check(output_root, out_info, video_keys, video_path_template)
+
+    logger.info(
+        "Delete complete: '%s' kept %d episode(s), %d frame(s), %d video(s). Output: %s",
+        meta.repo_id, out_info["total_episodes"], out_info["total_frames"],
+        out_info["total_videos"], output_root,
+    )
+    return output_root
+
+
 def _consistency_check(
     root: Path, info: dict, video_keys: list[str], video_path_template: str | None
 ) -> None:
@@ -561,16 +795,72 @@ def _cmd_merge(args: argparse.Namespace) -> int:
     return 0
 
 
+def _add_delete_parser(subparsers) -> None:
+    p = subparsers.add_parser(
+        "delete-episodes",
+        help="Delete episodes from a LeRobot v2.1 dataset (survivors re-indexed 0..N-1).",
+        description=(
+            "Delete episodes from a LeRobot v2.1 dataset. Surviving episodes are "
+            "re-indexed contiguously from 0; per-frame index/episode_index columns "
+            "and meta files are rebuilt."
+        ),
+    )
+    p.add_argument(
+        "--input",
+        required=True,
+        help="Source dataset root directory (contains meta/info.json).",
+    )
+    p.add_argument(
+        "--episode-indices",
+        nargs="+",
+        required=True,
+        type=int,
+        help="Source episode_index values to delete (space-separated, e.g. --episode-indices 0 3 5).",
+    )
+    out_group = p.add_mutually_exclusive_group(required=True)
+    out_group.add_argument(
+        "--output",
+        default=None,
+        help="Destination directory for the result (must not exist or be empty).",
+    )
+    out_group.add_argument(
+        "--in-place",
+        action="store_true",
+        help=(
+            "Write the result back into --input. The original is first moved aside to "
+            "<input>_backup_<timestamp> for reversibility."
+        ),
+    )
+    p.add_argument(
+        "--repo-id",
+        default=None,
+        help="repo_id recorded in the output info.json (default: keep source repo_id).",
+    )
+    p.set_defaults(func=_cmd_delete)
+
+
+def _cmd_delete(args: argparse.Namespace) -> int:
+    delete_episodes(
+        input=args.input,
+        episode_indices=args.episode_indices,
+        output=args.output,
+        repo_id=args.repo_id,
+        in_place=args.in_place,
+    )
+    return 0
+
+
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="lerobot-edit-dataset",
         description=(
             "Edit LeRobot datasets (format v2.1). "
-            "Sub-commands: merge. More (delete, split, ...) coming."
+            "Sub-commands: merge, delete-episodes. More (split, ...) coming."
         ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True, metavar="<command>")
     _add_merge_parser(subparsers)
+    _add_delete_parser(subparsers)
     return parser
 
 
