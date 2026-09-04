@@ -17,9 +17,9 @@
 
 This is the single entry point for all dataset editing operations. It currently
 implements ``merge``, ``delete-episodes``, ``rename-cameras``,
-``transform-features``, and ``delete-features`` for LeRobot v2.1 datasets.
-Future operations (split, ...) will be added as new sub-commands sharing the
-helpers in this module.
+``transform-features``, ``delete-features``, and ``reencode-videos`` for
+LeRobot v2.1 datasets. Future operations (split, ...) will be added as new
+sub-commands sharing the helpers in this module.
 
 Scope / limitations (v1):
     - Only the on-disk **v2.1** format is supported (one file per episode,
@@ -77,6 +77,13 @@ Examples:
             --input path/to/ds \\
             --features featureA featureB \\
             --output path/to/trimmed
+
+    Re-encode all videos to a common codec (e.g. before merge)::
+
+        lerobot-edit-dataset reencode-videos \\
+            --input path/to/ds \\
+            --codec h264 \\
+            --output path/to/reencoded
 """
 
 from __future__ import annotations
@@ -96,6 +103,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from tqdm import tqdm
 
+from lerobot.datasets.video_utils import get_video_info
 from lerobot.constants import OBS_IMAGES
 from lerobot.datasets.compute_stats import aggregate_stats, get_feature_stats
 from lerobot.datasets.lerobot_dataset import CODEBASE_VERSION, LeRobotDatasetMetadata
@@ -1691,6 +1699,334 @@ def delete_features(
 
 
 # =====================================================================================
+# reencode_videos operation
+# =====================================================================================
+# User-facing codec name -> (PyAV encoder name, expected canonical_name in meta)
+_REENCODE_CODECS: dict[str, tuple[str, str]] = {
+    "h264": ("h264", "h264"),
+    "libx264": ("h264", "h264"),
+    "hevc": ("hevc", "hevc"),
+    "h265": ("hevc", "hevc"),
+    "libx265": ("hevc", "hevc"),
+    "av1": ("libsvtav1", "av1"),
+    "libsvtav1": ("libsvtav1", "av1"),
+}
+
+
+def _resolve_reencode_codec(codec: str) -> tuple[str, str]:
+    key = codec.strip().lower()
+    if key not in _REENCODE_CODECS:
+        raise ValueError(
+            f"Unsupported codec {codec!r}. Choose one of: {sorted(set(_REENCODE_CODECS))}"
+        )
+    return _REENCODE_CODECS[key]
+
+
+def _reencode_video_file(
+    src: Path | str,
+    dst: Path | str,
+    encoder: str,
+    pix_fmt: str = "yuv420p",
+    crf: int = 23,
+    preset: str | None = "veryfast",
+    threads: int | None = None,
+) -> None:
+    """Re-encode a single mp4 with PyAV (video only, no audio)."""
+    import av
+
+    src = Path(src)
+    dst = Path(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(dst.name + ".tmp.mp4")
+    if tmp.exists():
+        tmp.unlink()
+
+    logging.getLogger("libav").setLevel(av.logging.ERROR)
+    try:
+        with av.open(str(src), "r") as inp:
+            if not inp.streams.video:
+                raise ValueError(f"No video stream in {src}")
+            in_stream = inp.streams.video[0]
+            rate = in_stream.average_rate or in_stream.base_rate
+            if rate is None or float(rate) <= 0:
+                raise ValueError(f"Cannot determine fps for {src}")
+
+            with av.open(str(tmp), "w", format="mp4") as out:
+                out_stream = out.add_stream(encoder, rate=rate)
+                out_stream.width = in_stream.width
+                out_stream.height = in_stream.height
+                out_stream.pix_fmt = pix_fmt
+                options: dict[str, str] = {"crf": str(crf)}
+                # x264/x265 honor preset; libsvtav1 ignores unknown keys harmlessly in many builds.
+                if preset:
+                    options["preset"] = preset
+                if threads is not None and threads > 0:
+                    options["threads"] = str(threads)
+                out_stream.options = options
+
+                for frame in inp.decode(video=0):
+                    frame = frame.reformat(
+                        width=out_stream.width, height=out_stream.height, format=pix_fmt
+                    )
+                    for packet in out_stream.encode(frame):
+                        out.mux(packet)
+                for packet in out_stream.encode():
+                    out.mux(packet)
+    finally:
+        av.logging.restore_default_callback()
+
+    if not tmp.is_file() or tmp.stat().st_size == 0:
+        if tmp.exists():
+            tmp.unlink()
+        raise OSError(f"Re-encode failed for {src}")
+    tmp.replace(dst)
+
+
+def _reencode_or_copy_one(
+    src: str,
+    dst: str,
+    encoder: str,
+    canonical: str,
+    pix_fmt: str,
+    crf: int,
+    preset: str | None,
+    threads: int | None,
+    force: bool,
+) -> str:
+    """Worker entry: return ``'skip'`` or ``'encode'``."""
+    src_p, dst_p = Path(src), Path(dst)
+    if not src_p.is_file():
+        raise FileNotFoundError(f"Video missing: {src_p}")
+
+    if not force:
+        try:
+            cur_codec = get_video_info(src_p).get("video.codec")
+        except Exception:  # noqa: BLE001
+            cur_codec = None
+        if cur_codec == canonical:
+            dst_p.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_p, dst_p)
+            return "skip"
+
+    _reencode_video_file(
+        src_p, dst_p, encoder=encoder, pix_fmt=pix_fmt, crf=crf, preset=preset, threads=threads
+    )
+    return "encode"
+
+
+def _update_video_feature_info(ft: dict, video_info: dict) -> None:
+    """Write probed video_info into both ``info`` and ``video_info`` blocks if present."""
+    for block in ("info", "video_info"):
+        if block in ft and isinstance(ft[block], dict):
+            for k, v in video_info.items():
+                if k.startswith("video.") or k == "has_audio":
+                    ft[block][k] = v
+        elif block == "info":
+            # Ensure at least info exists for merge compatibility checks.
+            ft["info"] = {k: v for k, v in video_info.items() if k.startswith("video.") or k == "has_audio"}
+
+
+def reencode_videos(
+    input: str | Path,
+    codec: str = "h264",
+    output: str | Path | None = None,
+    repo_id: str | None = None,
+    in_place: bool = False,
+    pix_fmt: str = "yuv420p",
+    crf: int = 23,
+    force: bool = False,
+    workers: int | None = None,
+    preset: str = "veryfast",
+) -> Path:
+    """Re-encode all dataset videos to a target codec and refresh video meta.
+
+    Copies parquet / episodes / tasks / stats unchanged. Useful to unify codecs
+    before ``merge``.
+
+    Args:
+        input: Source dataset root.
+        codec: Target codec alias (``h264``, ``hevc``, ``av1``, ...).
+        output: Destination directory (required unless ``in_place``).
+        repo_id: repo_id for output info.json.
+        in_place: Backup original then write into ``input``.
+        pix_fmt: Pixel format for encoder (default ``yuv420p``).
+        crf: Encoder quality (lower = better / larger).
+        force: Re-encode even if current codec already matches target.
+        workers: Parallel processes (default: CPU count). Use 1 for serial.
+        preset: Encoder speed preset (x264/x265), e.g. ``ultrafast`` / ``veryfast`` /
+            ``faster`` / ``fast`` / ``medium``. Faster presets use less CPU time
+            per frame at some quality/size cost.
+
+    Returns:
+        Output dataset root path.
+    """
+    import os
+    import time
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    encoder, canonical = _resolve_reencode_codec(codec)
+    if workers is None:
+        workers = max(1, os.cpu_count() or 1)
+    workers = max(1, int(workers))
+    # Avoid oversubscription: many processes each spawning many x264 threads.
+    per_job_threads = 1 if workers > 1 else None
+
+    src = Path(input).expanduser().resolve()
+    if not (src / INFO_PATH).is_file():
+        raise FileNotFoundError(f"Input is not a LeRobot dataset (missing {INFO_PATH}): {src}")
+
+    if in_place and output is not None:
+        raise ValueError("Cannot specify both --output and --in-place.")
+    if not in_place and output is None:
+        raise ValueError("Either --output or --in-place must be specified.")
+
+    meta = load_meta(src)
+    v = packaging.version.parse(meta.info["codebase_version"])
+    if v != packaging.version.parse(CODEBASE_VERSION):
+        raise ValueError(
+            f"reencode_videos only supports {CODEBASE_VERSION}; "
+            f"got {meta.info['codebase_version']}."
+        )
+
+    video_keys = list(meta.video_keys)
+    if not video_keys:
+        raise ValueError("Dataset has no video features to re-encode.")
+
+    video_path_template = meta.info.get("video_path")
+    if not video_path_template:
+        raise ValueError("Dataset info.json has no video_path template.")
+
+    # Resolve output dir.
+    if in_place:
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        backup = src.parent / f"{src.name}_backup_{ts}"
+        if backup.exists():
+            raise FileExistsError(f"Backup path already exists: {backup}")
+        output_root = src
+        shutil.move(str(src), str(backup))
+        source_dir = backup
+        logger.info("Moved original dataset to backup: %s", backup)
+    else:
+        output_root = Path(output).expanduser().resolve()  # type: ignore[arg-type]
+        if output_root.exists() and any(output_root.iterdir()):
+            raise FileExistsError(
+                f"Output directory {output_root} already exists and is not empty."
+            )
+        if output_root == src:
+            raise ValueError("Output path must not equal input path (use --in-place instead).")
+        source_dir = src
+
+    chunks_size = meta.chunks_size
+    data_path_template = meta.info["data_path"]
+    all_eps = sorted(meta.episodes.keys())
+
+    output_root.mkdir(parents=True, exist_ok=True)
+    (output_root / "meta").mkdir(parents=True, exist_ok=True)
+
+    # Copy meta tables / stats / parquet as-is.
+    for rel in (TASKS_PATH, EPISODES_PATH, EPISODES_STATS_PATH, STATS_PATH):
+        src_path = source_dir / rel
+        if src_path.is_file():
+            shutil.copy2(src_path, output_root / rel)
+
+    for ep_idx in all_eps:
+        src_pq = source_dir / _format_parquet_path(ep_idx, chunks_size, data_path_template)
+        if not src_pq.is_file():
+            raise FileNotFoundError(f"Missing parquet for episode {ep_idx}: {src_pq}")
+        dst_pq = output_root / _format_parquet_path(ep_idx, chunks_size, data_path_template)
+        dst_pq.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src_pq, dst_pq)
+
+    jobs: list[tuple[str, str]] = []
+    for ep_idx in all_eps:
+        for vid_key in video_keys:
+            src_vid = source_dir / _format_video_path(
+                ep_idx, chunks_size, video_path_template, vid_key
+            )
+            if not src_vid.is_file():
+                raise FileNotFoundError(
+                    f"Video missing for episode {ep_idx} key {vid_key}: {src_vid}"
+                )
+            dst_vid = output_root / _format_video_path(
+                ep_idx, chunks_size, video_path_template, vid_key
+            )
+            jobs.append((str(src_vid), str(dst_vid)))
+
+    logger.info(
+        "Re-encoding %d video(s) in '%s' -> codec=%s encoder=%s workers=%d preset=%s.",
+        len(jobs), meta.repo_id, canonical, encoder, workers, preset,
+    )
+
+    n_skip = 0
+    n_encode = 0
+    pbar = tqdm(total=len(jobs), unit="vid", desc="reencode", dynamic_ncols=True)
+    try:
+        if workers == 1:
+            for src_s, dst_s in jobs:
+                status = _reencode_or_copy_one(
+                    src_s, dst_s, encoder, canonical, pix_fmt, crf, preset, per_job_threads, force
+                )
+                if status == "skip":
+                    n_skip += 1
+                else:
+                    n_encode += 1
+                pbar.update(1)
+        else:
+            with ProcessPoolExecutor(max_workers=workers) as pool:
+                futures = [
+                    pool.submit(
+                        _reencode_or_copy_one,
+                        src_s,
+                        dst_s,
+                        encoder,
+                        canonical,
+                        pix_fmt,
+                        crf,
+                        preset,
+                        per_job_threads,
+                        force,
+                    )
+                    for src_s, dst_s in jobs
+                ]
+                for fut in as_completed(futures):
+                    status = fut.result()
+                    if status == "skip":
+                        n_skip += 1
+                    else:
+                        n_encode += 1
+                    pbar.update(1)
+    finally:
+        pbar.close()
+
+    # Refresh video feature meta from episode 0 outputs.
+    out_info = copy.deepcopy(meta.info)
+    out_info["repo_id"] = repo_id if repo_id is not None else meta.repo_id
+    first_ep = all_eps[0]
+    for vid_key in video_keys:
+        dst_vid = output_root / _format_video_path(
+            first_ep, chunks_size, video_path_template, vid_key
+        )
+        probed = get_video_info(dst_vid)
+        if not probed:
+            raise RuntimeError(f"Failed to probe re-encoded video: {dst_vid}")
+        if probed.get("video.codec") != canonical:
+            logger.warning(
+                "Probed codec for %s is %r, expected %r.",
+                vid_key, probed.get("video.codec"), canonical,
+            )
+        _update_video_feature_info(out_info["features"][vid_key], probed)
+
+    write_json(out_info, output_root / INFO_PATH)
+    _consistency_check(output_root, out_info, video_keys, video_path_template)
+
+    logger.info(
+        "Reencode complete: '%s' encoded=%d skipped=%d -> %s. Output: %s",
+        meta.repo_id, n_encode, n_skip, canonical, output_root,
+    )
+    return output_root
+
+
+# =====================================================================================
 # CLI
 # =====================================================================================
 def _add_merge_parser(subparsers) -> None:
@@ -1968,13 +2304,102 @@ def _cmd_delete_features(args: argparse.Namespace) -> int:
     return 0
 
 
+def _add_reencode_videos_parser(subparsers) -> None:
+    p = subparsers.add_parser(
+        "reencode-videos",
+        help="Re-encode all dataset videos to a target codec (e.g. h264).",
+        description=(
+            "Re-encode every mp4 under videos/ to a common codec and refresh "
+            "video meta in info.json. Parquet and non-video meta are copied "
+            "unchanged. Useful to unify codecs before merge. Videos already in "
+            "the target codec are copied unless --force is set."
+        ),
+    )
+    p.add_argument(
+        "--input",
+        required=True,
+        help="Source dataset root directory (contains meta/info.json).",
+    )
+    p.add_argument(
+        "--codec",
+        default="h264",
+        help="Target codec: h264 (default), hevc/h265, or av1.",
+    )
+    p.add_argument(
+        "--pix-fmt",
+        default="yuv420p",
+        help="Pixel format for the encoder (default: yuv420p).",
+    )
+    p.add_argument(
+        "--crf",
+        type=int,
+        default=23,
+        help="Encoder CRF quality (lower = better / larger). Default: 23.",
+    )
+    p.add_argument(
+        "--preset",
+        default="veryfast",
+        help=(
+            "Encoder speed preset for x264/x265 (default: veryfast). "
+            "Faster: ultrafast/veryfast/faster; slower/better: fast/medium/slow."
+        ),
+    )
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Parallel worker processes (default: CPU count). Use 1 for serial.",
+    )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-encode even if the current codec already matches the target.",
+    )
+    out_group = p.add_mutually_exclusive_group(required=True)
+    out_group.add_argument(
+        "--output",
+        default=None,
+        help="Destination directory for the result (must not exist or be empty).",
+    )
+    out_group.add_argument(
+        "--in-place",
+        action="store_true",
+        help=(
+            "Write the result back into --input. The original is first moved aside to "
+            "<input>_backup_<timestamp> for reversibility."
+        ),
+    )
+    p.add_argument(
+        "--repo-id",
+        default=None,
+        help="repo_id recorded in the output info.json (default: keep source repo_id).",
+    )
+    p.set_defaults(func=_cmd_reencode_videos)
+
+
+def _cmd_reencode_videos(args: argparse.Namespace) -> int:
+    reencode_videos(
+        input=args.input,
+        codec=args.codec,
+        output=args.output,
+        repo_id=args.repo_id,
+        in_place=args.in_place,
+        pix_fmt=args.pix_fmt,
+        crf=args.crf,
+        force=args.force,
+        workers=args.workers,
+        preset=args.preset,
+    )
+    return 0
+
+
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="lerobot-edit-dataset",
         description=(
             "Edit LeRobot datasets (format v2.1). "
             "Sub-commands: merge, delete-episodes, rename-cameras, "
-            "transform-features, delete-features."
+            "transform-features, delete-features, reencode-videos."
         ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True, metavar="<command>")
@@ -1983,6 +2408,7 @@ def make_parser() -> argparse.ArgumentParser:
     _add_rename_cameras_parser(subparsers)
     _add_transform_features_parser(subparsers)
     _add_delete_features_parser(subparsers)
+    _add_reencode_videos_parser(subparsers)
     return parser
 
 
