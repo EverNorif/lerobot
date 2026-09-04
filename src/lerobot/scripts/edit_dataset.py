@@ -16,9 +16,9 @@
 """Edit tool for LeRobot datasets (format **v2.1**).
 
 This is the single entry point for all dataset editing operations. It currently
-implements ``merge``, ``delete-episodes``, and ``rename-cameras`` for LeRobot
-v2.1 datasets. Future operations (split, ...) will be added as new sub-commands
-sharing the helpers in this module.
+implements ``merge``, ``delete-episodes``, ``rename-cameras``, and
+``transform-features`` for LeRobot v2.1 datasets. Future operations (split, ...)
+will be added as new sub-commands sharing the helpers in this module.
 
 Scope / limitations (v1):
     - Only the on-disk **v2.1** format is supported (one file per episode,
@@ -30,13 +30,6 @@ Scope / limitations (v1):
       but are not guaranteed.
     - Merge requires sources to be strictly compatible (same fps, features,
       chunks_size, video encoding info). Incompatible sources raise an error.
-
-lerobot-edit-dataset rename-cameras \
-  --input real_sim_dataset/rre_sortitem_yam_sim_v0 \
-  --rename observation.images.first_person_camera_rgb=observation.images.head \
-  --rename observation.images.left_hand_camera_rgb=observation.images.left_wrist \
-  --rename observation.images.right_hand_camera_rgb=observation.images.right_wrist \
-  --output real_sim_dataset/rre_sortitem_yam_sim_v0_renamed
 
 Examples:
 
@@ -68,15 +61,25 @@ Examples:
             --rename left_hand_camera_rgb=cam_left \\
             --rename observation.images.right_hand_camera_rgb=observation.images.cam_right \\
             --output path/to/renamed
+
+    Transform float vector features with a user callback::
+
+        lerobot-edit-dataset transform-features \\
+            --input path/to/ds \\
+            --transform examples/transform_state_example.py \\
+            --features observation.state action \\
+            --output path/to/transformed
 """
 
 from __future__ import annotations
 
 import argparse
 import copy
+import importlib.util
 import logging
 import shutil
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -86,7 +89,7 @@ import pyarrow.parquet as pq
 from tqdm import tqdm
 
 from lerobot.constants import OBS_IMAGES
-from lerobot.datasets.compute_stats import aggregate_stats
+from lerobot.datasets.compute_stats import aggregate_stats, get_feature_stats
 from lerobot.datasets.lerobot_dataset import CODEBASE_VERSION, LeRobotDatasetMetadata
 from lerobot.datasets.utils import (
     DEFAULT_PARQUET_PATH,
@@ -110,6 +113,10 @@ from lerobot.datasets.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+_FLOAT_DTYPES = frozenset({"float32", "float64"})
+TransformFn = Callable[[str, np.ndarray], np.ndarray]
+FeatureMetaFn = Callable[[str, dict], dict]
 
 # Fields of a video feature's global "info" block that must match across sources
 # (see lerobot.datasets.video_utils.get_video_info). The block is the same for
@@ -1070,6 +1077,384 @@ def rename_cameras(
 
 
 # =====================================================================================
+# transform_features operation
+# =====================================================================================
+def _is_float_vector_feature(ft: dict) -> bool:
+    if ft.get("dtype") not in _FLOAT_DTYPES:
+        return False
+    shape = ft.get("shape")
+    if shape is None:
+        return False
+    # Vector features are 1-D in info (per-frame dim); scalars are shape (1,) which we still allow.
+    return len(tuple(shape)) == 1
+
+
+def _list_float_vector_keys(features: dict) -> list[str]:
+    return [k for k, ft in features.items() if _is_float_vector_feature(ft)]
+
+
+def _resolve_transform_feature_keys(features: dict, feature_keys: list[str] | None) -> list[str]:
+    """Validate / default the set of float vector keys to transform."""
+    available = _list_float_vector_keys(features)
+    if feature_keys is None or len(feature_keys) == 0:
+        if not available:
+            raise ValueError("No float vector features found to transform.")
+        return available
+
+    resolved: list[str] = []
+    for key in feature_keys:
+        if key not in features:
+            raise ValueError(
+                f"Unknown feature {key!r}. Available: {sorted(features)}"
+            )
+        ft = features[key]
+        if ft.get("dtype") in ("video", "image"):
+            raise ValueError(
+                f"Cannot transform visual feature {key!r} (dtype={ft.get('dtype')!r}). "
+                "Only float vector features are supported."
+            )
+        if not _is_float_vector_feature(ft):
+            raise ValueError(
+                f"Feature {key!r} is not a float vector "
+                f"(dtype={ft.get('dtype')!r}, shape={ft.get('shape')!r})."
+            )
+        resolved.append(key)
+    return resolved
+
+
+def _load_transform_spec(
+    transform: str | TransformFn,
+    feature_meta: FeatureMetaFn | None = None,
+) -> tuple[TransformFn, FeatureMetaFn | None]:
+    """Load ``transform`` (and optional ``feature_meta``) from a callable or ``path.py[:fn]``."""
+    if callable(transform):
+        meta_fn = feature_meta
+        if meta_fn is None and hasattr(transform, "feature_meta"):
+            meta_fn = getattr(transform, "feature_meta")
+        return transform, meta_fn
+
+    spec = str(transform).strip()
+    path_str, fn_name = spec, "transform"
+    if ":" in spec:
+        left, right = spec.rsplit(":", 1)
+        if left.endswith(".py") and right.isidentifier():
+            path_str, fn_name = left, right
+
+    path = Path(path_str).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Transform module not found: {path}")
+
+    mod_name = f"lerobot_user_transform_{path.stem}"
+    spec_obj = importlib.util.spec_from_file_location(mod_name, path)
+    if spec_obj is None or spec_obj.loader is None:
+        raise ImportError(f"Could not load transform module from {path}")
+    module = importlib.util.module_from_spec(spec_obj)
+    spec_obj.loader.exec_module(module)
+
+    if not hasattr(module, fn_name):
+        raise AttributeError(f"Transform module {path} has no attribute {fn_name!r}")
+    fn = getattr(module, fn_name)
+    if not callable(fn):
+        raise TypeError(f"{path}:{fn_name} is not callable")
+
+    meta_fn = feature_meta
+    if meta_fn is None and hasattr(module, "feature_meta"):
+        candidate = getattr(module, "feature_meta")
+        if callable(candidate):
+            meta_fn = candidate
+    return fn, meta_fn
+
+
+def _column_to_2d_array(column, expected_dim: int | None = None) -> np.ndarray:
+    """Convert a parquet list/fixed-size float column to ``(T, D)`` ndarray."""
+    values = column.to_pylist()
+    if not values:
+        dim = expected_dim if expected_dim is not None else 0
+        return np.zeros((0, dim), dtype=np.float32)
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.ndim == 1:
+        # list of scalars somehow — treat as (T, 1)
+        arr = arr.reshape(-1, 1)
+    if arr.ndim != 2:
+        raise ValueError(f"Expected 2D float vector column, got shape {arr.shape}")
+    return arr
+
+
+def _array_to_list_column(arr: np.ndarray, dtype_name: str) -> pa.Array:
+    np_dtype = np.float32 if dtype_name == "float32" else np.float64
+    arr = np.asarray(arr, dtype=np_dtype)
+    arrow_type = pa.float32() if dtype_name == "float32" else pa.float64()
+    return pa.array(arr.tolist(), type=pa.list_(arrow_type))
+
+
+def _apply_transform_checked(
+    key: str,
+    arr: np.ndarray,
+    transform_fn: TransformFn,
+) -> np.ndarray:
+    """Call user transform and validate ``(T, D')`` with same ``T``."""
+    out = transform_fn(key, arr)
+    out = np.asarray(out)
+    if out.ndim != 2:
+        raise ValueError(
+            f"transform({key!r}, ...) must return a 2D array (T, D'); got shape {out.shape}"
+        )
+    if out.shape[0] != arr.shape[0]:
+        raise ValueError(
+            f"transform({key!r}, ...) changed time length: {arr.shape[0]} -> {out.shape[0]}"
+        )
+    return out
+
+
+def _infer_feature_meta(feature: dict, new_dim: int) -> dict:
+    """Default feature meta update when user did not provide ``feature_meta``."""
+    ft = copy.deepcopy(feature)
+    ft["shape"] = (int(new_dim),)
+    names = ft.get("names")
+    if names is not None:
+        if isinstance(names, (list, tuple)) and len(names) == new_dim:
+            ft["names"] = list(names)
+        else:
+            ft["names"] = None
+    return ft
+
+
+def _update_features_with_meta(
+    features: dict,
+    keys: list[str],
+    feature_meta_fn: FeatureMetaFn | None,
+    probed_dims: dict[str, int] | None = None,
+) -> dict:
+    out = copy.deepcopy(features)
+    for key in keys:
+        if feature_meta_fn is not None:
+            updated = feature_meta_fn(key, copy.deepcopy(out[key]))
+            if not isinstance(updated, dict):
+                raise TypeError(f"feature_meta({key!r}, ...) must return a dict")
+            if "shape" not in updated and probed_dims is not None and key in probed_dims:
+                updated = dict(updated)
+                updated["shape"] = (int(probed_dims[key]),)
+            out[key] = updated
+        elif probed_dims is not None and key in probed_dims:
+            out[key] = _infer_feature_meta(out[key], probed_dims[key])
+    return out
+
+
+def _validate_output_against_meta(key: str, arr: np.ndarray, feature: dict) -> None:
+    shape = tuple(feature.get("shape", ()))
+    if len(shape) != 1:
+        raise ValueError(f"Feature {key!r} shape after transform must be 1-D, got {shape}")
+    if arr.shape[1] != int(shape[0]):
+        raise ValueError(
+            f"transform({key!r}, ...) output dim {arr.shape[1]} != feature shape {shape[0]}"
+        )
+    names = feature.get("names")
+    if names is not None and len(names) != arr.shape[1]:
+        raise ValueError(
+            f"Feature {key!r} names length {len(names)} != output dim {arr.shape[1]}"
+        )
+
+
+def transform_features(
+    input: str | Path,
+    transform: str | TransformFn,
+    features: list[str] | None = None,
+    output: str | Path | None = None,
+    repo_id: str | None = None,
+    in_place: bool = False,
+    feature_meta: FeatureMetaFn | None = None,
+) -> Path:
+    """Apply a user transform to float vector features in a LeRobot v2.1 dataset.
+
+    Args:
+        input: Source dataset root.
+        transform: Callable ``(key, array) -> array`` or ``path.py[:fn_name]`` string.
+            Optional companion ``feature_meta(key, feature) -> feature`` is loaded from
+            the same module when present (or passed explicitly).
+        features: Feature keys to transform. Default: all float32/float64 vector keys.
+        output: Destination directory (required unless ``in_place``).
+        repo_id: repo_id for output info.json.
+        in_place: Backup original then write into ``input``.
+        feature_meta: Optional explicit meta updater (overrides module ``feature_meta``).
+
+    Returns:
+        Output dataset root path.
+    """
+    import time
+
+    src = Path(input).expanduser().resolve()
+    if not (src / INFO_PATH).is_file():
+        raise FileNotFoundError(f"Input is not a LeRobot dataset (missing {INFO_PATH}): {src}")
+
+    if in_place and output is not None:
+        raise ValueError("Cannot specify both --output and --in-place.")
+    if not in_place and output is None:
+        raise ValueError("Either --output or --in-place must be specified.")
+
+    meta = load_meta(src)
+    v = packaging.version.parse(meta.info["codebase_version"])
+    if v != packaging.version.parse(CODEBASE_VERSION):
+        raise ValueError(
+            f"transform_features only supports {CODEBASE_VERSION}; "
+            f"got {meta.info['codebase_version']}."
+        )
+
+    transform_fn, feature_meta_fn = _load_transform_spec(transform, feature_meta=feature_meta)
+    target_keys = _resolve_transform_feature_keys(meta.info["features"], features)
+
+    # Resolve output dir.
+    if in_place:
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        backup = src.parent / f"{src.name}_backup_{ts}"
+        if backup.exists():
+            raise FileExistsError(f"Backup path already exists: {backup}")
+        output_root = src
+        shutil.move(str(src), str(backup))
+        source_dir = backup
+        logger.info("Moved original dataset to backup: %s", backup)
+    else:
+        output_root = Path(output).expanduser().resolve()  # type: ignore[arg-type]
+        if output_root.exists() and any(output_root.iterdir()):
+            raise FileExistsError(
+                f"Output directory {output_root} already exists and is not empty."
+            )
+        if output_root == src:
+            raise ValueError("Output path must not equal input path (use --in-place instead).")
+        source_dir = src
+
+    chunks_size = meta.chunks_size
+    data_path_template = meta.info["data_path"]
+    video_path_template = meta.info.get("video_path")
+    video_keys = list(meta.video_keys)
+    all_eps = sorted(meta.episodes.keys())
+    if not all_eps:
+        raise ValueError("Dataset has no episodes.")
+
+    # Probe first episode to infer new dims / apply feature_meta.
+    first_ep = all_eps[0]
+    first_pq = source_dir / _format_parquet_path(first_ep, chunks_size, data_path_template)
+    if not first_pq.is_file():
+        raise FileNotFoundError(f"Missing parquet for episode {first_ep}: {first_pq}")
+    first_table = pq.read_table(first_pq)
+    probed_dims: dict[str, int] = {}
+    for key in target_keys:
+        if key not in first_table.schema.names:
+            raise KeyError(f"Feature {key!r} missing from parquet columns: {first_table.schema.names}")
+        old_dim = int(meta.info["features"][key]["shape"][0])
+        arr = _column_to_2d_array(first_table.column(key), expected_dim=old_dim)
+        out = _apply_transform_checked(key, arr, transform_fn)
+        probed_dims[key] = int(out.shape[1])
+
+    out_info = copy.deepcopy(meta.info)
+    out_info["features"] = _update_features_with_meta(
+        out_info["features"], target_keys, feature_meta_fn, probed_dims=probed_dims
+    )
+    # Ensure shape matches probe when feature_meta omitted shape.
+    for key in target_keys:
+        _validate_output_against_meta(
+            key,
+            np.zeros((1, probed_dims[key])),
+            out_info["features"][key],
+        )
+    out_info["repo_id"] = repo_id if repo_id is not None else meta.repo_id
+
+    output_root.mkdir(parents=True, exist_ok=True)
+    (output_root / "meta").mkdir(parents=True, exist_ok=True)
+
+    for rel in (TASKS_PATH, EPISODES_PATH):
+        src_path = source_dir / rel
+        if src_path.is_file():
+            shutil.copy2(src_path, output_root / rel)
+
+    src_episodes_stats = load_episodes_stats(source_dir) if (source_dir / EPISODES_STATS_PATH).is_file() else {}
+    all_episode_stats: list[dict] = []
+    episodes_stats_out_path = output_root / EPISODES_STATS_PATH
+
+    logger.info(
+        "Transforming features %s in '%s' (%d episodes).",
+        target_keys, meta.repo_id, len(all_eps),
+    )
+
+    pbar = tqdm(total=len(all_eps), unit="ep", desc="transform-features", dynamic_ncols=True)
+    try:
+        for ep_idx in all_eps:
+            src_pq = source_dir / _format_parquet_path(ep_idx, chunks_size, data_path_template)
+            if not src_pq.is_file():
+                raise FileNotFoundError(f"Missing parquet for episode {ep_idx}: {src_pq}")
+            table = pq.read_table(src_pq)
+            length = table.num_rows
+
+            transformed_arrays: dict[str, np.ndarray] = {}
+            columns = []
+            for name in table.schema.names:
+                if name in target_keys:
+                    old_dim = int(meta.info["features"][name]["shape"][0])
+                    arr = _column_to_2d_array(table.column(name), expected_dim=old_dim)
+                    out_arr = _apply_transform_checked(name, arr, transform_fn)
+                    _validate_output_against_meta(name, out_arr, out_info["features"][name])
+                    dtype_name = out_info["features"][name]["dtype"]
+                    columns.append(_array_to_list_column(out_arr, dtype_name))
+                    transformed_arrays[name] = np.asarray(
+                        out_arr, dtype=np.float32 if dtype_name == "float32" else np.float64
+                    )
+                else:
+                    columns.append(table.column(name))
+
+            new_table = pa.table(columns, names=list(table.schema.names))
+            dst_pq = output_root / _format_parquet_path(ep_idx, chunks_size, data_path_template)
+            dst_pq.parent.mkdir(parents=True, exist_ok=True)
+            pq.write_table(new_table, dst_pq)
+
+            # Videos unchanged.
+            if video_path_template is not None:
+                for vid_key in video_keys:
+                    src_vid = source_dir / _format_video_path(
+                        ep_idx, chunks_size, video_path_template, vid_key
+                    )
+                    if not src_vid.is_file():
+                        raise FileNotFoundError(
+                            f"Video missing for episode {ep_idx} key {vid_key}: {src_vid}"
+                        )
+                    dst_vid = output_root / _format_video_path(
+                        ep_idx, chunks_size, video_path_template, vid_key
+                    )
+                    dst_vid.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src_vid, dst_vid)
+
+            # Episode stats: recompute transformed keys; copy the rest.
+            ep_stats: dict = {}
+            if ep_idx in src_episodes_stats:
+                ep_stats = copy.deepcopy(src_episodes_stats[ep_idx])
+            for key, arr in transformed_arrays.items():
+                keepdims = arr.ndim == 1
+                ep_stats[key] = get_feature_stats(arr, axis=0, keepdims=keepdims)
+            # Drop stats for keys that somehow disappeared (shouldn't).
+            append_jsonlines(
+                {"episode_index": ep_idx, "stats": serialize_dict(ep_stats)},
+                episodes_stats_out_path,
+            )
+            all_episode_stats.append(ep_stats)
+            pbar.update(1)
+            _ = length  # length kept for clarity / future checks
+    finally:
+        pbar.close()
+
+    write_json(out_info, output_root / INFO_PATH)
+    if all_episode_stats:
+        write_stats(aggregate_stats(all_episode_stats), output_root)
+    else:
+        logger.warning("No episode stats produced; skipping stats.json.")
+
+    _consistency_check(output_root, out_info, video_keys, video_path_template)
+
+    logger.info(
+        "Transform complete: '%s' features=%s. Output: %s",
+        meta.repo_id, target_keys, output_root,
+    )
+    return output_root
+
+
+# =====================================================================================
 # CLI
 # =====================================================================================
 def _add_merge_parser(subparsers) -> None:
@@ -1224,18 +1609,88 @@ def _cmd_rename_cameras(args: argparse.Namespace) -> int:
     return 0
 
 
+def _add_transform_features_parser(subparsers) -> None:
+    p = subparsers.add_parser(
+        "transform-features",
+        help="Apply a user transform to float vector features (state/action/...).",
+        description=(
+            "Rewrite float vector parquet columns with a user callback "
+            "transform(key, array) -> array. Optionally provide feature_meta(key, feature) "
+            "in the same module to update shape/names (e.g. after deleting dims). "
+            "Stats for transformed keys are recomputed; videos are copied unchanged."
+        ),
+    )
+    p.add_argument(
+        "--input",
+        required=True,
+        help="Source dataset root directory (contains meta/info.json).",
+    )
+    p.add_argument(
+        "--transform",
+        required=True,
+        metavar="PATH[:FN]",
+        help=(
+            "Python file exporting transform(key, x) -> x. "
+            "Optional :fn_name (default: transform). "
+            "If the module also defines feature_meta(key, feature) -> feature, it is used."
+        ),
+    )
+    p.add_argument(
+        "--features",
+        nargs="+",
+        default=None,
+        help=(
+            "Feature keys to transform (e.g. observation.state action). "
+            "Default: all float32/float64 vector features."
+        ),
+    )
+    out_group = p.add_mutually_exclusive_group(required=True)
+    out_group.add_argument(
+        "--output",
+        default=None,
+        help="Destination directory for the result (must not exist or be empty).",
+    )
+    out_group.add_argument(
+        "--in-place",
+        action="store_true",
+        help=(
+            "Write the result back into --input. The original is first moved aside to "
+            "<input>_backup_<timestamp> for reversibility."
+        ),
+    )
+    p.add_argument(
+        "--repo-id",
+        default=None,
+        help="repo_id recorded in the output info.json (default: keep source repo_id).",
+    )
+    p.set_defaults(func=_cmd_transform_features)
+
+
+def _cmd_transform_features(args: argparse.Namespace) -> int:
+    transform_features(
+        input=args.input,
+        transform=args.transform,
+        features=args.features,
+        output=args.output,
+        repo_id=args.repo_id,
+        in_place=args.in_place,
+    )
+    return 0
+
+
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="lerobot-edit-dataset",
         description=(
             "Edit LeRobot datasets (format v2.1). "
-            "Sub-commands: merge, delete-episodes, rename-cameras."
+            "Sub-commands: merge, delete-episodes, rename-cameras, transform-features."
         ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True, metavar="<command>")
     _add_merge_parser(subparsers)
     _add_delete_parser(subparsers)
     _add_rename_cameras_parser(subparsers)
+    _add_transform_features_parser(subparsers)
     return parser
 
 
