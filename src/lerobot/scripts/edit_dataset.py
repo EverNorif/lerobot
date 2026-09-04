@@ -16,9 +16,10 @@
 """Edit tool for LeRobot datasets (format **v2.1**).
 
 This is the single entry point for all dataset editing operations. It currently
-implements ``merge``, ``delete-episodes``, ``rename-cameras``, and
-``transform-features`` for LeRobot v2.1 datasets. Future operations (split, ...)
-will be added as new sub-commands sharing the helpers in this module.
+implements ``merge``, ``delete-episodes``, ``rename-cameras``,
+``transform-features``, and ``delete-features`` for LeRobot v2.1 datasets.
+Future operations (split, ...) will be added as new sub-commands sharing the
+helpers in this module.
 
 Scope / limitations (v1):
     - Only the on-disk **v2.1** format is supported (one file per episode,
@@ -69,6 +70,13 @@ Examples:
             --transform examples/transform_state_example.py \\
             --features observation.state action \\
             --output path/to/transformed
+
+    Delete specified features (e.g. state_progress or a camera)::
+
+        lerobot-edit-dataset delete-features \\
+            --input path/to/ds \\
+            --features featureA featureB \\
+            --output path/to/trimmed
 """
 
 from __future__ import annotations
@@ -92,6 +100,7 @@ from lerobot.constants import OBS_IMAGES
 from lerobot.datasets.compute_stats import aggregate_stats, get_feature_stats
 from lerobot.datasets.lerobot_dataset import CODEBASE_VERSION, LeRobotDatasetMetadata
 from lerobot.datasets.utils import (
+    DEFAULT_FEATURES,
     DEFAULT_PARQUET_PATH,
     DEFAULT_VIDEO_PATH,
     EPISODES_PATH,
@@ -1455,6 +1464,233 @@ def transform_features(
 
 
 # =====================================================================================
+# delete_features operation
+# =====================================================================================
+_PROTECTED_FEATURE_KEYS = frozenset(DEFAULT_FEATURES)
+
+
+def _validate_features_to_delete(features: dict, keys: list[str]) -> list[str]:
+    if not keys:
+        raise ValueError("Must specify at least one feature to delete.")
+    # Preserve order, drop duplicates.
+    seen: set[str] = set()
+    resolved: list[str] = []
+    for key in keys:
+        if key in seen:
+            continue
+        seen.add(key)
+        if key in _PROTECTED_FEATURE_KEYS:
+            raise ValueError(
+                f"Cannot delete protected feature {key!r}. "
+                f"Protected: {sorted(_PROTECTED_FEATURE_KEYS)}"
+            )
+        if key not in features:
+            raise ValueError(
+                f"Feature {key!r} not found in dataset. Available: {sorted(features)}"
+            )
+        resolved.append(key)
+    if not resolved:
+        raise ValueError("No features left to delete after de-duplication.")
+    remaining = set(features) - set(resolved)
+    if not remaining:
+        raise ValueError("Refusing to delete every feature (result would be empty).")
+    return resolved
+
+
+def delete_features(
+    input: str | Path,
+    features: list[str],
+    output: str | Path | None = None,
+    repo_id: str | None = None,
+    in_place: bool = False,
+) -> Path:
+    """Delete specified feature keys from a LeRobot v2.1 dataset.
+
+    Removes keys from ``info.json`` features, parquet columns, video directories
+    (for video keys), and stats. Core columns in ``DEFAULT_FEATURES`` cannot be
+    deleted.
+
+    Args:
+        input: Source dataset root.
+        features: Feature keys to remove.
+        output: Destination directory (required unless ``in_place``).
+        repo_id: repo_id for output info.json.
+        in_place: Backup original then write into ``input``.
+
+    Returns:
+        Output dataset root path.
+    """
+    import time
+
+    src = Path(input).expanduser().resolve()
+    if not (src / INFO_PATH).is_file():
+        raise FileNotFoundError(f"Input is not a LeRobot dataset (missing {INFO_PATH}): {src}")
+
+    if in_place and output is not None:
+        raise ValueError("Cannot specify both --output and --in-place.")
+    if not in_place and output is None:
+        raise ValueError("Either --output or --in-place must be specified.")
+
+    meta = load_meta(src)
+    v = packaging.version.parse(meta.info["codebase_version"])
+    if v != packaging.version.parse(CODEBASE_VERSION):
+        raise ValueError(
+            f"delete_features only supports {CODEBASE_VERSION}; "
+            f"got {meta.info['codebase_version']}."
+        )
+
+    delete_keys = _validate_features_to_delete(meta.info["features"], list(features))
+    delete_set = set(delete_keys)
+
+    # Resolve output dir.
+    if in_place:
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        backup = src.parent / f"{src.name}_backup_{ts}"
+        if backup.exists():
+            raise FileExistsError(f"Backup path already exists: {backup}")
+        output_root = src
+        shutil.move(str(src), str(backup))
+        source_dir = backup
+        logger.info("Moved original dataset to backup: %s", backup)
+    else:
+        output_root = Path(output).expanduser().resolve()  # type: ignore[arg-type]
+        if output_root.exists() and any(output_root.iterdir()):
+            raise FileExistsError(
+                f"Output directory {output_root} already exists and is not empty."
+            )
+        if output_root == src:
+            raise ValueError("Output path must not equal input path (use --in-place instead).")
+        source_dir = src
+
+    chunks_size = meta.chunks_size
+    data_path_template = meta.info["data_path"]
+    video_path_template = meta.info.get("video_path")
+    src_video_keys = list(meta.video_keys)
+    out_video_keys = [k for k in src_video_keys if k not in delete_set]
+    src_image_keys = list(meta.image_keys)
+    out_image_keys = [k for k in src_image_keys if k not in delete_set]
+
+    out_info = copy.deepcopy(meta.info)
+    for key in delete_keys:
+        out_info["features"].pop(key, None)
+    out_info["repo_id"] = repo_id if repo_id is not None else meta.repo_id
+    out_info["total_videos"] = int(out_info["total_episodes"]) * len(out_video_keys)
+
+    output_root.mkdir(parents=True, exist_ok=True)
+    (output_root / "meta").mkdir(parents=True, exist_ok=True)
+
+    for rel in (TASKS_PATH, EPISODES_PATH):
+        src_path = source_dir / rel
+        if src_path.is_file():
+            shutil.copy2(src_path, output_root / rel)
+
+    # Stats: drop deleted keys; re-aggregate from episode stats.
+    src_episodes_stats = (
+        load_episodes_stats(source_dir) if (source_dir / EPISODES_STATS_PATH).is_file() else {}
+    )
+    all_episode_stats: list[dict] = []
+    episodes_stats_out_path = output_root / EPISODES_STATS_PATH
+
+    all_eps = sorted(meta.episodes.keys())
+    logger.info(
+        "Deleting %d feature(s) from '%s' (%d episodes): %s",
+        len(delete_keys), meta.repo_id, len(all_eps), delete_keys,
+    )
+
+    pbar = tqdm(total=len(all_eps), unit="ep", desc="delete-features", dynamic_ncols=True)
+    try:
+        for ep_idx in all_eps:
+            src_pq = source_dir / _format_parquet_path(ep_idx, chunks_size, data_path_template)
+            if not src_pq.is_file():
+                raise FileNotFoundError(f"Missing parquet for episode {ep_idx}: {src_pq}")
+            table = pq.read_table(src_pq)
+
+            keep_names = [n for n in table.schema.names if n not in delete_set]
+            if len(keep_names) == len(table.schema.names):
+                # No parquet columns matched (e.g. pure video key delete); still copy.
+                dst_pq = output_root / _format_parquet_path(ep_idx, chunks_size, data_path_template)
+                dst_pq.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src_pq, dst_pq)
+            else:
+                new_table = table.select(keep_names)
+                dst_pq = output_root / _format_parquet_path(ep_idx, chunks_size, data_path_template)
+                dst_pq.parent.mkdir(parents=True, exist_ok=True)
+                pq.write_table(new_table, dst_pq)
+
+            # Videos: skip deleted video keys.
+            if video_path_template is not None:
+                for vid_key in out_video_keys:
+                    src_vid = source_dir / _format_video_path(
+                        ep_idx, chunks_size, video_path_template, vid_key
+                    )
+                    if not src_vid.is_file():
+                        raise FileNotFoundError(
+                            f"Video missing for episode {ep_idx} key {vid_key}: {src_vid}"
+                        )
+                    dst_vid = output_root / _format_video_path(
+                        ep_idx, chunks_size, video_path_template, vid_key
+                    )
+                    dst_vid.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src_vid, dst_vid)
+
+            # Optional standalone image dirs.
+            for img_key in out_image_keys:
+                src_img_dir = source_dir / "images" / img_key
+                if not src_img_dir.is_dir():
+                    continue
+                ep_src = src_img_dir / f"episode_{ep_idx:06d}"
+                if ep_src.is_dir():
+                    dst_ep = output_root / "images" / img_key / f"episode_{ep_idx:06d}"
+                    if dst_ep.exists():
+                        shutil.rmtree(dst_ep)
+                    shutil.copytree(ep_src, dst_ep)
+
+            # Episode stats without deleted keys.
+            if ep_idx in src_episodes_stats:
+                ep_stats = {
+                    k: v for k, v in src_episodes_stats[ep_idx].items() if k not in delete_set
+                }
+                append_jsonlines(
+                    {"episode_index": ep_idx, "stats": serialize_dict(ep_stats)},
+                    episodes_stats_out_path,
+                )
+                all_episode_stats.append(ep_stats)
+
+            pbar.update(1)
+    finally:
+        pbar.close()
+
+    # Best-effort copy of non-episode-structured image dirs that remain.
+    src_images_root = source_dir / "images"
+    if src_images_root.is_dir():
+        for img_key in out_image_keys:
+            src_img_dir = src_images_root / img_key
+            dst_img_dir = output_root / "images" / img_key
+            if src_img_dir.is_dir() and not dst_img_dir.exists():
+                shutil.copytree(src_img_dir, dst_img_dir)
+
+    write_json(out_info, output_root / INFO_PATH)
+
+    if all_episode_stats:
+        write_stats(aggregate_stats(all_episode_stats), output_root)
+    else:
+        src_stats_path = source_dir / STATS_PATH
+        if src_stats_path.is_file():
+            stats = load_json(src_stats_path)
+            write_json({k: v for k, v in stats.items() if k not in delete_set}, output_root / STATS_PATH)
+        else:
+            logger.warning("No episode/global stats found; skipping stats.json.")
+
+    _consistency_check(output_root, out_info, out_video_keys, video_path_template)
+
+    logger.info(
+        "Delete-features complete: '%s' removed %s. Output: %s",
+        meta.repo_id, delete_keys, output_root,
+    )
+    return output_root
+
+
+# =====================================================================================
 # CLI
 # =====================================================================================
 def _add_merge_parser(subparsers) -> None:
@@ -1678,12 +1914,67 @@ def _cmd_transform_features(args: argparse.Namespace) -> int:
     return 0
 
 
+def _add_delete_features_parser(subparsers) -> None:
+    p = subparsers.add_parser(
+        "delete-features",
+        help="Delete specified feature keys from a LeRobot v2.1 dataset.",
+        description=(
+            "Remove feature keys from info/stats/parquet (and video directories for "
+            "video keys). Core columns (timestamp, frame_index, episode_index, "
+            "index, task_index) cannot be deleted."
+        ),
+    )
+    p.add_argument(
+        "--input",
+        required=True,
+        help="Source dataset root directory (contains meta/info.json).",
+    )
+    p.add_argument(
+        "--features",
+        nargs="+",
+        required=True,
+        help="Feature keys to delete (e.g. state_progress observation.images.head).",
+    )
+    out_group = p.add_mutually_exclusive_group(required=True)
+    out_group.add_argument(
+        "--output",
+        default=None,
+        help="Destination directory for the result (must not exist or be empty).",
+    )
+    out_group.add_argument(
+        "--in-place",
+        action="store_true",
+        help=(
+            "Write the result back into --input. The original is first moved aside to "
+            "<input>_backup_<timestamp> for reversibility."
+        ),
+    )
+    p.add_argument(
+        "--repo-id",
+        default=None,
+        help="repo_id recorded in the output info.json (default: keep source repo_id).",
+    )
+    p.set_defaults(func=_cmd_delete_features)
+
+
+def _cmd_delete_features(args: argparse.Namespace) -> int:
+    delete_features(
+        input=args.input,
+        features=args.features,
+        output=args.output,
+        repo_id=args.repo_id,
+        in_place=args.in_place,
+    )
+    return 0
+
+
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="lerobot-edit-dataset",
         description=(
             "Edit LeRobot datasets (format v2.1). "
-            "Sub-commands: merge, delete-episodes, rename-cameras, transform-features."
+            "Sub-commands: merge, delete-episodes, rename-cameras, "
+            "transform-features, delete-features."
         ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True, metavar="<command>")
@@ -1691,6 +1982,7 @@ def make_parser() -> argparse.ArgumentParser:
     _add_delete_parser(subparsers)
     _add_rename_cameras_parser(subparsers)
     _add_transform_features_parser(subparsers)
+    _add_delete_features_parser(subparsers)
     return parser
 
 
