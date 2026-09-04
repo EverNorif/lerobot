@@ -16,9 +16,9 @@
 """Edit tool for LeRobot datasets (format **v2.1**).
 
 This is the single entry point for all dataset editing operations. It currently
-implements the ``merge`` sub-command which concatenates several LeRobot v2.1
-datasets into one. Future operations (delete_episodes, split, ...) will be added
-as new sub-commands sharing the helpers in this module.
+implements ``merge``, ``delete-episodes``, and ``rename-cameras`` for LeRobot
+v2.1 datasets. Future operations (split, ...) will be added as new sub-commands
+sharing the helpers in this module.
 
 Scope / limitations (v1):
     - Only the on-disk **v2.1** format is supported (one file per episode,
@@ -30,6 +30,13 @@ Scope / limitations (v1):
       but are not guaranteed.
     - Merge requires sources to be strictly compatible (same fps, features,
       chunks_size, video encoding info). Incompatible sources raise an error.
+
+lerobot-edit-dataset rename-cameras \
+  --input real_sim_dataset/rre_sortitem_yam_sim_v0 \
+  --rename observation.images.first_person_camera_rgb=observation.images.head \
+  --rename observation.images.left_hand_camera_rgb=observation.images.left_wrist \
+  --rename observation.images.right_hand_camera_rgb=observation.images.right_wrist \
+  --output real_sim_dataset/rre_sortitem_yam_sim_v0_renamed
 
 Examples:
 
@@ -53,6 +60,14 @@ Examples:
             --input path/to/ds \\
             --episode-indices 0 3 \\
             --in-place
+
+    Rename cameras (short names or full feature keys)::
+
+        lerobot-edit-dataset rename-cameras \\
+            --input path/to/ds \\
+            --rename left_hand_camera_rgb=cam_left \\
+            --rename observation.images.right_hand_camera_rgb=observation.images.cam_right \\
+            --output path/to/renamed
 """
 
 from __future__ import annotations
@@ -70,6 +85,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from tqdm import tqdm
 
+from lerobot.constants import OBS_IMAGES
 from lerobot.datasets.compute_stats import aggregate_stats
 from lerobot.datasets.lerobot_dataset import CODEBASE_VERSION, LeRobotDatasetMetadata
 from lerobot.datasets.utils import (
@@ -89,6 +105,7 @@ from lerobot.datasets.utils import (
     load_jsonlines,
     serialize_dict,
     write_json,
+    write_jsonlines,
     write_stats,
 )
 
@@ -756,6 +773,303 @@ def _consistency_check(
 
 
 # =====================================================================================
+# rename_cameras operation
+# =====================================================================================
+def _normalize_camera_key(name: str) -> str:
+    """Accept a full feature key or a short camera name.
+
+    Short names (no ``.``) are prefixed with ``observation.images.``.
+    """
+    name = name.strip()
+    if not name:
+        raise ValueError("Camera key must be non-empty.")
+    if "." in name:
+        return name
+    return f"{OBS_IMAGES}.{name}"
+
+
+def _parse_rename_pairs(pairs: list[str]) -> dict[str, str]:
+    """Parse ``OLD=NEW`` CLI pairs into a normalized old->new mapping."""
+    mapping: dict[str, str] = {}
+    for raw in pairs:
+        if "=" not in raw:
+            raise ValueError(f"Invalid --rename value {raw!r}; expected OLD=NEW.")
+        old_raw, new_raw = raw.split("=", 1)
+        old_key = _normalize_camera_key(old_raw)
+        new_key = _normalize_camera_key(new_raw)
+        if old_key in mapping and mapping[old_key] != new_key:
+            raise ValueError(f"Duplicate rename source {old_key!r}: {mapping[old_key]!r} vs {new_key!r}.")
+        mapping[old_key] = new_key
+    # Drop no-ops.
+    return {old: new for old, new in mapping.items() if old != new}
+
+
+def _validate_camera_rename_map(
+    features: dict,
+    rename_map: dict[str, str],
+) -> None:
+    """Ensure ``rename_map`` only remaps existing cameras without key collisions."""
+    if not rename_map:
+        raise ValueError("No effective renames provided (empty map or all OLD==NEW).")
+
+    camera_keys = {k for k, ft in features.items() if ft.get("dtype") in ("video", "image")}
+    all_keys = set(features)
+
+    for old in rename_map:
+        if old not in camera_keys:
+            raise ValueError(
+                f"Cannot rename {old!r}: not an existing camera key. "
+                f"Available cameras: {sorted(camera_keys)}"
+            )
+
+    new_targets = list(rename_map.values())
+    if len(new_targets) != len(set(new_targets)):
+        raise ValueError(f"Duplicate rename targets in map: {rename_map}")
+
+    # Simulate final key set for collision detection.
+    final_keys: set[str] = set()
+    for key in all_keys:
+        final = rename_map.get(key, key)
+        if final in final_keys:
+            raise ValueError(
+                f"Rename collision: multiple features would become {final!r}. Map={rename_map}"
+            )
+        final_keys.add(final)
+
+    # New camera names must not collide with non-camera features that stay put.
+    for old, new in rename_map.items():
+        if new in all_keys and new not in rename_map and new != old:
+            # `new` already exists and is not itself being renamed away.
+            raise ValueError(
+                f"Cannot rename {old!r} -> {new!r}: target key already exists in features."
+            )
+
+
+def _rename_dict_keys(d: dict, rename_map: dict[str, str]) -> dict:
+    """Return a shallow-key-renamed copy of ``d`` (values reused)."""
+    out: dict = {}
+    for key, value in d.items():
+        new_key = rename_map.get(key, key)
+        if new_key in out:
+            raise ValueError(f"Key collision while renaming stats/features at {new_key!r}.")
+        out[new_key] = value
+    return out
+
+
+def _copy_or_rename_parquet_columns(
+    src_path: Path,
+    dst_path: Path,
+    rename_map: dict[str, str],
+) -> None:
+    """Copy a parquet file, renaming columns that appear in ``rename_map``."""
+    table = pq.read_table(src_path)
+    old_names = list(table.schema.names)
+    new_names = [rename_map.get(n, n) for n in old_names]
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    if new_names == old_names:
+        shutil.copy2(src_path, dst_path)
+        return
+    if len(new_names) != len(set(new_names)):
+        raise ValueError(f"Parquet column rename collision in {src_path}: {old_names} -> {new_names}")
+    pq.write_table(table.rename_columns(new_names), dst_path)
+
+
+def rename_cameras(
+    input: str | Path,
+    rename: list[str] | dict[str, str],
+    output: str | Path | None = None,
+    repo_id: str | None = None,
+    in_place: bool = False,
+) -> Path:
+    """Rename camera feature keys in a LeRobot v2.1 dataset.
+
+    Updates ``info.json`` features, ``stats.json``, ``episodes_stats.jsonl``,
+    video directory names (``videos/.../{video_key}/...``), and parquet column
+    names when image cameras are embedded as columns.
+
+    Args:
+        input: Source dataset root directory.
+        rename: Either a list of ``OLD=NEW`` strings or an already-parsed
+            ``{old_key: new_key}`` mapping. Short names (no ``.``) are prefixed
+            with ``observation.images.``.
+        output: Destination directory (required unless ``in_place``). Must be empty/absent.
+        repo_id: repo_id recorded in the output info.json (default: keep source).
+        in_place: If True, write back into ``input`` after moving the original aside
+            as ``<input>_backup_<ts>``. Exclusive with ``output``.
+
+    Returns:
+        The output dataset root path.
+    """
+    import time
+
+    src = Path(input).expanduser().resolve()
+    if not (src / INFO_PATH).is_file():
+        raise FileNotFoundError(f"Input is not a LeRobot dataset (missing {INFO_PATH}): {src}")
+
+    if in_place and output is not None:
+        raise ValueError("Cannot specify both --output and --in-place.")
+    if not in_place and output is None:
+        raise ValueError("Either --output or --in-place must be specified.")
+
+    meta = load_meta(src)
+    v = packaging.version.parse(meta.info["codebase_version"])
+    if v != packaging.version.parse(CODEBASE_VERSION):
+        raise ValueError(
+            f"rename_cameras only supports {CODEBASE_VERSION}; got {meta.info['codebase_version']}."
+        )
+
+    if isinstance(rename, dict):
+        rename_map = {
+            _normalize_camera_key(k): _normalize_camera_key(v)
+            for k, v in rename.items()
+            if _normalize_camera_key(k) != _normalize_camera_key(v)
+        }
+    else:
+        rename_map = _parse_rename_pairs(list(rename))
+    _validate_camera_rename_map(meta.info["features"], rename_map)
+
+    # Resolve output dir.
+    if in_place:
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        backup = src.parent / f"{src.name}_backup_{ts}"
+        if backup.exists():
+            raise FileExistsError(f"Backup path already exists: {backup}")
+        output_root = src
+        shutil.move(str(src), str(backup))
+        source_dir = backup
+        logger.info("Moved original dataset to backup: %s", backup)
+    else:
+        output_root = Path(output).expanduser().resolve()  # type: ignore[arg-type]
+        if output_root.exists() and any(output_root.iterdir()):
+            raise FileExistsError(
+                f"Output directory {output_root} already exists and is not empty."
+            )
+        if output_root == src:
+            raise ValueError("Output path must not equal input path (use --in-place instead).")
+        source_dir = src
+
+    chunks_size = meta.chunks_size
+    data_path_template = meta.info["data_path"]
+    video_path_template = meta.info.get("video_path")
+    src_video_keys = list(meta.video_keys)
+    src_image_keys = list(meta.image_keys)
+    needs_parquet_rewrite = any(k in rename_map for k in src_image_keys)
+
+    out_info = copy.deepcopy(meta.info)
+    out_info["features"] = _rename_dict_keys(out_info["features"], rename_map)
+    out_info["repo_id"] = repo_id if repo_id is not None else meta.repo_id
+    out_video_keys = [rename_map.get(k, k) for k in src_video_keys]
+
+    output_root.mkdir(parents=True, exist_ok=True)
+    (output_root / "meta").mkdir(parents=True, exist_ok=True)
+
+    # Preserve task + episode tables verbatim.
+    for rel in (TASKS_PATH, EPISODES_PATH):
+        src_path = source_dir / rel
+        if src_path.is_file():
+            shutil.copy2(src_path, output_root / rel)
+
+    # Rewrite stats with renamed camera keys (no recompute).
+    src_stats_path = source_dir / STATS_PATH
+    if src_stats_path.is_file():
+        stats = load_json(src_stats_path)
+        write_json(_rename_dict_keys(stats, rename_map), output_root / STATS_PATH)
+    else:
+        logger.warning("No stats.json found; skipping.")
+
+    src_ep_stats_path = source_dir / EPISODES_STATS_PATH
+    if src_ep_stats_path.is_file():
+        ep_stats_lines = load_jsonlines(src_ep_stats_path)
+        rewritten = []
+        for row in ep_stats_lines:
+            row = dict(row)
+            if "stats" in row and isinstance(row["stats"], dict):
+                row["stats"] = _rename_dict_keys(row["stats"], rename_map)
+            rewritten.append(row)
+        write_jsonlines(rewritten, output_root / EPISODES_STATS_PATH)
+    else:
+        logger.warning("No episodes_stats.jsonl found; skipping.")
+
+    all_eps = sorted(meta.episodes.keys())
+    logger.info(
+        "Renaming %d camera(s) in '%s' (%d episodes): %s",
+        len(rename_map),
+        meta.repo_id,
+        len(all_eps),
+        ", ".join(f"{o} -> {n}" for o, n in rename_map.items()),
+    )
+
+    pbar = tqdm(total=len(all_eps), unit="ep", desc="rename-cameras", dynamic_ncols=True)
+    try:
+        for ep_idx in all_eps:
+            # 1. Parquet: rewrite columns only when image cameras are renamed.
+            src_pq = source_dir / _format_parquet_path(ep_idx, chunks_size, data_path_template)
+            if not src_pq.is_file():
+                raise FileNotFoundError(f"Missing parquet for episode {ep_idx}: {src_pq}")
+            dst_pq = output_root / _format_parquet_path(ep_idx, chunks_size, data_path_template)
+            if needs_parquet_rewrite:
+                _copy_or_rename_parquet_columns(src_pq, dst_pq, rename_map)
+            else:
+                dst_pq.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src_pq, dst_pq)
+
+            # 2. Videos: copy under possibly-new video_key directories.
+            if video_path_template is not None:
+                for src_key in src_video_keys:
+                    dst_key = rename_map.get(src_key, src_key)
+                    src_vid = source_dir / _format_video_path(
+                        ep_idx, chunks_size, video_path_template, src_key
+                    )
+                    if not src_vid.is_file():
+                        raise FileNotFoundError(
+                            f"Video missing for episode {ep_idx} key {src_key}: {src_vid}"
+                        )
+                    dst_vid = output_root / _format_video_path(
+                        ep_idx, chunks_size, video_path_template, dst_key
+                    )
+                    dst_vid.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src_vid, dst_vid)
+
+            # 3. Optional standalone image directories (best-effort).
+            for src_key in src_image_keys:
+                dst_key = rename_map.get(src_key, src_key)
+                src_img_dir = source_dir / "images" / src_key
+                if not src_img_dir.is_dir():
+                    continue
+                dst_img_dir = output_root / "images" / dst_key
+                # Copy only this episode's frames if present; else copy whole tree once.
+                ep_src = src_img_dir / f"episode_{ep_idx:06d}"
+                if ep_src.is_dir():
+                    dst_ep = dst_img_dir / f"episode_{ep_idx:06d}"
+                    if dst_ep.exists():
+                        shutil.rmtree(dst_ep)
+                    shutil.copytree(ep_src, dst_ep)
+
+            pbar.update(1)
+    finally:
+        pbar.close()
+
+    # Best-effort: if images/ exists but was not episode-structured, copy remaining dirs.
+    src_images_root = source_dir / "images"
+    if src_images_root.is_dir():
+        for src_key in src_image_keys:
+            dst_key = rename_map.get(src_key, src_key)
+            src_img_dir = src_images_root / src_key
+            dst_img_dir = output_root / "images" / dst_key
+            if src_img_dir.is_dir() and not dst_img_dir.exists():
+                shutil.copytree(src_img_dir, dst_img_dir)
+
+    write_json(out_info, output_root / INFO_PATH)
+    _consistency_check(output_root, out_info, out_video_keys, video_path_template)
+
+    logger.info(
+        "Rename complete: '%s' -> %d camera rename(s). Output: %s",
+        meta.repo_id, len(rename_map), output_root,
+    )
+    return output_root
+
+
+# =====================================================================================
 # CLI
 # =====================================================================================
 def _add_merge_parser(subparsers) -> None:
@@ -850,17 +1164,78 @@ def _cmd_delete(args: argparse.Namespace) -> int:
     return 0
 
 
+def _add_rename_cameras_parser(subparsers) -> None:
+    p = subparsers.add_parser(
+        "rename-cameras",
+        help="Rename camera feature keys in a LeRobot v2.1 dataset.",
+        description=(
+            "Rename camera (video/image) feature keys. Updates info features, "
+            "stats, episodes_stats, video directory names, and image parquet "
+            "columns when applicable. Short names without '.' are prefixed with "
+            "observation.images."
+        ),
+    )
+    p.add_argument(
+        "--input",
+        required=True,
+        help="Source dataset root directory (contains meta/info.json).",
+    )
+    p.add_argument(
+        "--rename",
+        action="append",
+        required=True,
+        metavar="OLD=NEW",
+        help=(
+            "Camera rename mapping (repeatable). Accepts short names "
+            "(e.g. left_cam=cam_left) or full feature keys "
+            "(e.g. observation.images.left_cam=observation.images.cam_left)."
+        ),
+    )
+    out_group = p.add_mutually_exclusive_group(required=True)
+    out_group.add_argument(
+        "--output",
+        default=None,
+        help="Destination directory for the result (must not exist or be empty).",
+    )
+    out_group.add_argument(
+        "--in-place",
+        action="store_true",
+        help=(
+            "Write the result back into --input. The original is first moved aside to "
+            "<input>_backup_<timestamp> for reversibility."
+        ),
+    )
+    p.add_argument(
+        "--repo-id",
+        default=None,
+        help="repo_id recorded in the output info.json (default: keep source repo_id).",
+    )
+    p.set_defaults(func=_cmd_rename_cameras)
+
+
+def _cmd_rename_cameras(args: argparse.Namespace) -> int:
+    rename_cameras(
+        input=args.input,
+        rename=args.rename,
+        output=args.output,
+        repo_id=args.repo_id,
+        in_place=args.in_place,
+    )
+    return 0
+
+
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="lerobot-edit-dataset",
         description=(
             "Edit LeRobot datasets (format v2.1). "
-            "Sub-commands: merge, delete-episodes. More (split, ...) coming."
+            "Sub-commands: merge, delete-episodes, rename-cameras."
         ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True, metavar="<command>")
     _add_merge_parser(subparsers)
     _add_delete_parser(subparsers)
+    _add_rename_cameras_parser(subparsers)
     return parser
 
 
