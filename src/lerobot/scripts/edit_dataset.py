@@ -17,9 +17,9 @@
 
 This is the single entry point for all dataset editing operations. It currently
 implements ``merge``, ``delete-episodes``, ``rename-cameras``,
-``transform-features``, ``delete-features``, and ``reencode-videos`` for
-LeRobot v2.1 datasets. Future operations (split, ...) will be added as new
-sub-commands sharing the helpers in this module.
+``transform-features``, ``delete-features``, ``reencode-videos``, and
+``trim-static-frames`` for LeRobot v2.1 datasets. Future operations (split, ...)
+will be added as new sub-commands sharing the helpers in this module.
 
 Scope / limitations (v1):
     - Only the on-disk **v2.1** format is supported (one file per episode,
@@ -84,6 +84,14 @@ Examples:
             --input path/to/ds \\
             --codec h264 \\
             --output path/to/reencoded
+
+    Trim leading/trailing near-static frames (sync parquet + videos)::
+
+        lerobot-edit-dataset trim-static-frames \\
+            --input path/to/ds \\
+            --feature action \\
+            --threshold 0.005 \\
+            --output path/to/trimmed
 """
 
 from __future__ import annotations
@@ -2027,6 +2035,661 @@ def reencode_videos(
 
 
 # =====================================================================================
+# trim_static_frames operation
+# =====================================================================================
+def _motion_deltas(arr: np.ndarray, window: int = 1) -> np.ndarray:
+    """Per-step L2 motion of a ``(T, D)`` array; optional moving-average of length ``window``."""
+    if arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+    if len(arr) < 2:
+        return np.zeros(0, dtype=np.float64)
+    deltas = np.linalg.norm(np.diff(arr.astype(np.float64), axis=0), axis=1)
+    if window <= 1:
+        return deltas
+    kernel = np.ones(window, dtype=np.float64) / float(window)
+    return np.convolve(deltas, kernel, mode="same")
+
+
+def detect_static_trim_bounds(
+    arr: np.ndarray,
+    threshold: float,
+    *,
+    trim_leading: bool = True,
+    trim_trailing: bool = True,
+    window: int = 1,
+    min_frames: int = 1,
+    max_trim_ratio: float = 0.8,
+) -> tuple[int, int]:
+    """Return ``[start, end)`` keep range after dropping near-static borders.
+
+    A step ``t -> t+1`` is static when the (optionally smoothed) L2 delta is
+    ``< threshold``. Leading static steps drop frames ``0..k``; trailing static
+    steps drop frames after the last significant step.
+    """
+    if threshold < 0:
+        raise ValueError(f"threshold must be >= 0, got {threshold}")
+    if not 0 < max_trim_ratio <= 1:
+        raise ValueError(f"max_trim_ratio must be in (0, 1], got {max_trim_ratio}")
+    length = int(arr.shape[0])
+    if length == 0:
+        return 0, 0
+    if length < 2 or (not trim_leading and not trim_trailing):
+        return 0, length
+
+    deltas = _motion_deltas(arr, window=window)
+    start = 0
+    if trim_leading:
+        while start < len(deltas) and deltas[start] < threshold:
+            start += 1
+        # Frame ``start`` is the first frame involved in a significant step
+        # (or the last frame if the whole episode is static).
+
+    end = length
+    if trim_trailing:
+        k = len(deltas) - 1
+        while k >= 0 and deltas[k] < threshold:
+            k -= 1
+        # Last significant step is deltas[k] between frames k and k+1; keep through k+1.
+        end = (k + 2) if k >= 0 else start
+
+    if end < start:
+        end = start
+
+    # Cap total trim so we never discard more than max_trim_ratio of the episode.
+    max_drop = int(length * max_trim_ratio)
+    dropped = (start) + (length - end)
+    if dropped > max_drop and dropped > 0:
+        # Shrink trims proportionally.
+        lead, trail = start, length - end
+        scale = max_drop / dropped
+        start = int(lead * scale)
+        end = length - int(trail * scale)
+
+    kept = end - start
+    if kept < min_frames:
+        # Prefer keeping a centered window of min_frames when possible.
+        if length <= min_frames:
+            return 0, length
+        # Expand symmetrically around the detected keep region.
+        need = min_frames - kept
+        left = need // 2
+        right = need - left
+        start = max(0, start - left)
+        end = min(length, end + right)
+        if end - start < min_frames:
+            start = 0
+            end = min(length, min_frames)
+    return start, end
+
+
+def _trim_video_file(
+    src: Path | str,
+    dst: Path | str,
+    start_frame: int,
+    end_frame: int,
+    encoder: str,
+    pix_fmt: str = "yuv420p",
+    crf: int = 23,
+    preset: str | None = "veryfast",
+    threads: int | None = None,
+) -> None:
+    """Re-encode ``src[start_frame:end_frame]`` into ``dst`` (video only)."""
+    import av
+
+    src = Path(src)
+    dst = Path(dst)
+    if start_frame < 0 or end_frame <= start_frame:
+        raise ValueError(f"Invalid trim range [{start_frame}, {end_frame}) for {src}")
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(dst.name + ".tmp.mp4")
+    if tmp.exists():
+        tmp.unlink()
+
+    logging.getLogger("libav").setLevel(av.logging.ERROR)
+    written = 0
+    try:
+        with av.open(str(src), "r") as inp:
+            if not inp.streams.video:
+                raise ValueError(f"No video stream in {src}")
+            in_stream = inp.streams.video[0]
+            rate = in_stream.average_rate or in_stream.base_rate
+            if rate is None or float(rate) <= 0:
+                raise ValueError(f"Cannot determine fps for {src}")
+
+            with av.open(str(tmp), "w", format="mp4") as out:
+                out_stream = out.add_stream(encoder, rate=rate)
+                out_stream.width = in_stream.width
+                out_stream.height = in_stream.height
+                out_stream.pix_fmt = pix_fmt
+                options: dict[str, str] = {"crf": str(crf)}
+                if preset:
+                    options["preset"] = preset
+                if threads is not None and threads > 0:
+                    options["threads"] = str(threads)
+                out_stream.options = options
+
+                for idx, frame in enumerate(inp.decode(video=0)):
+                    if idx < start_frame:
+                        continue
+                    if idx >= end_frame:
+                        break
+                    frame = frame.reformat(
+                        width=out_stream.width, height=out_stream.height, format=pix_fmt
+                    )
+                    for packet in out_stream.encode(frame):
+                        out.mux(packet)
+                    written += 1
+                for packet in out_stream.encode():
+                    out.mux(packet)
+    finally:
+        av.logging.restore_default_callback()
+
+    expected = end_frame - start_frame
+    if written != expected:
+        logger.warning(
+            "Video trim frame count mismatch for %s: wrote %d, expected %d "
+            "(start=%d end=%d).",
+            src, written, expected, start_frame, end_frame,
+        )
+    if not tmp.is_file() or tmp.stat().st_size == 0:
+        if tmp.exists():
+            tmp.unlink()
+        raise OSError(f"Video trim failed for {src}")
+    tmp.replace(dst)
+
+
+def _trim_video_worker(
+    src: str,
+    dst: str,
+    start_frame: int,
+    end_frame: int,
+    encoder: str,
+    pix_fmt: str,
+    crf: int,
+    preset: str | None,
+    threads: int | None,
+) -> None:
+    _trim_video_file(
+        src, dst, start_frame, end_frame,
+        encoder=encoder, pix_fmt=pix_fmt, crf=crf, preset=preset, threads=threads,
+    )
+
+
+def _rewrite_trimmed_parquet(
+    src_path: Path,
+    dst_path: Path,
+    start: int,
+    end: int,
+    new_episode_index: int,
+    new_index_start: int,
+    fps: float,
+) -> int:
+    """Slice ``[start, end)`` and rewrite index / episode_index / frame_index / timestamp."""
+    table = pq.read_table(src_path)
+    if end > table.num_rows or start < 0:
+        raise ValueError(
+            f"Trim range [{start}, {end}) out of bounds for {src_path} "
+            f"(rows={table.num_rows})"
+        )
+    table = table.slice(start, end - start)
+    length = table.num_rows
+    if length == 0:
+        raise ValueError(f"Trim produced empty episode for {src_path}")
+
+    new_index = pa.array(np.arange(new_index_start, new_index_start + length, dtype=np.int64))
+    new_ep = pa.array(np.full(length, new_episode_index, dtype=np.int64))
+    new_fi = pa.array(np.arange(length, dtype=np.int64))
+    new_ts = pa.array((np.arange(length, dtype=np.float64) / float(fps)).astype(np.float32))
+
+    columns = []
+    for name in table.schema.names:
+        if name == "index":
+            columns.append(new_index)
+        elif name == "episode_index":
+            columns.append(new_ep)
+        elif name == "frame_index":
+            columns.append(new_fi)
+        elif name == "timestamp":
+            columns.append(new_ts)
+        else:
+            columns.append(table.column(name))
+
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.table(columns, schema=table.schema), dst_path)
+    return length
+
+
+def _recompute_episode_stats_from_parquet(
+    pq_path: Path,
+    features: dict,
+    old_ep_stats: dict | None = None,
+) -> dict:
+    """Recompute non-visual feature stats; reuse old visual stats with updated count."""
+    table = pq.read_table(pq_path)
+    length = table.num_rows
+    ep_stats: dict = {}
+    for key, ft in features.items():
+        dtype = ft.get("dtype")
+        if dtype in ("video", "image", "string"):
+            if old_ep_stats is not None and key in old_ep_stats:
+                reused = copy.deepcopy(old_ep_stats[key])
+                if isinstance(reused, dict) and "count" in reused:
+                    reused["count"] = np.array([length])
+                ep_stats[key] = reused
+            continue
+        if key not in table.schema.names:
+            continue
+        arr = _column_to_2d_array(table.column(key))
+        # Scalar-like columns may come back as (T, 1); get_feature_stats expects ndarray.
+        if arr.shape[1] == 1 and tuple(ft.get("shape", ())) == (1,):
+            flat = arr.reshape(-1)
+            ep_stats[key] = get_feature_stats(flat, axis=0, keepdims=True)
+        else:
+            ep_stats[key] = get_feature_stats(arr, axis=0, keepdims=arr.ndim == 1)
+    return ep_stats
+
+
+def trim_static_frames(
+    input: str | Path,
+    output: str | Path | None = None,
+    repo_id: str | None = None,
+    in_place: bool = False,
+    feature: str = "action",
+    threshold: float = 0.005,
+    trim_leading: bool = True,
+    trim_trailing: bool = True,
+    window: int = 1,
+    min_frames: int = 30,
+    max_trim_ratio: float = 0.8,
+    dry_run: bool = False,
+    codec: str | None = None,
+    pix_fmt: str = "yuv420p",
+    crf: int = 23,
+    preset: str = "veryfast",
+    workers: int | None = None,
+) -> Path | dict:
+    """Trim leading/trailing near-static frames from every episode.
+
+    Detection uses L2 deltas of ``feature`` (default ``action``). Parquet rows and
+    all video keys are trimmed to the same ``[start, end)`` range; ``frame_index``,
+    ``timestamp``, and global ``index`` are rewritten. Episode indices are kept.
+
+    Args:
+        input: Source dataset root.
+        output / in_place: Destination (mutually exclusive). Ignored for ``dry_run``.
+        feature: Float vector feature used for motion detection.
+        threshold: Steps with L2 delta ``< threshold`` count as static.
+        trim_leading / trim_trailing: Which borders to trim.
+        window: Moving-average window over deltas (1 = raw).
+        min_frames: Minimum frames to keep per episode.
+        max_trim_ratio: Max fraction of an episode that may be dropped.
+        dry_run: Only report planned trims; do not write.
+        codec: Optional override for video re-encode (default: keep source codec).
+        pix_fmt / crf / preset / workers: Video re-encode knobs.
+
+    Returns:
+        Output root path, or a summary dict when ``dry_run``.
+    """
+    import os
+    import time
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    src = Path(input).expanduser().resolve()
+    if not (src / INFO_PATH).is_file():
+        raise FileNotFoundError(f"Input is not a LeRobot dataset (missing {INFO_PATH}): {src}")
+
+    if not dry_run:
+        if in_place and output is not None:
+            raise ValueError("Cannot specify both --output and --in-place.")
+        if not in_place and output is None:
+            raise ValueError("Either --output or --in-place must be specified.")
+
+    meta = load_meta(src)
+    v = packaging.version.parse(meta.info["codebase_version"])
+    if v != packaging.version.parse(CODEBASE_VERSION):
+        raise ValueError(
+            f"trim_static_frames only supports {CODEBASE_VERSION}; "
+            f"got {meta.info['codebase_version']}."
+        )
+
+    features = meta.info["features"]
+    if feature not in features:
+        raise ValueError(f"Unknown feature {feature!r}. Available: {sorted(features)}")
+    if not _is_float_vector_feature(features[feature]):
+        raise ValueError(
+            f"Feature {feature!r} must be a float vector "
+            f"(dtype={features[feature].get('dtype')!r}, shape={features[feature].get('shape')!r})."
+        )
+
+    fps = float(meta.info["fps"])
+    chunks_size = meta.chunks_size
+    data_path_template = meta.info["data_path"]
+    video_path_template = meta.info.get("video_path")
+    video_keys = list(meta.video_keys)
+    all_eps = sorted(meta.episodes.keys())
+    if not all_eps:
+        raise ValueError("Dataset has no episodes.")
+
+    # Probe motion bounds for every episode first.
+    plans: list[dict] = []
+    for ep_idx in all_eps:
+        src_pq = src / _format_parquet_path(ep_idx, chunks_size, data_path_template)
+        if not src_pq.is_file():
+            raise FileNotFoundError(f"Missing parquet for episode {ep_idx}: {src_pq}")
+        table = pq.read_table(src_pq, columns=[feature])
+        arr = _column_to_2d_array(table.column(feature))
+        length = int(arr.shape[0])
+        start, end = detect_static_trim_bounds(
+            arr,
+            threshold,
+            trim_leading=trim_leading,
+            trim_trailing=trim_trailing,
+            window=window,
+            min_frames=min_frames,
+            max_trim_ratio=max_trim_ratio,
+        )
+        plans.append(
+            {
+                "episode_index": ep_idx,
+                "length": length,
+                "start": start,
+                "end": end,
+                "kept": end - start,
+                "drop_lead": start,
+                "drop_trail": length - end,
+            }
+        )
+
+    lead_drops = np.array([p["drop_lead"] for p in plans], dtype=np.int64)
+    trail_drops = np.array([p["drop_trail"] for p in plans], dtype=np.int64)
+    kept = np.array([p["kept"] for p in plans], dtype=np.int64)
+    frames_before = int(sum(p["length"] for p in plans))
+    frames_after = int(kept.sum())
+    kept_pct = 100.0 * frames_after / max(frames_before, 1)
+    summary = {
+        "episodes": len(plans),
+        "feature": feature,
+        "threshold": threshold,
+        "window": window,
+        "fps": fps,
+        "trim_leading": trim_leading,
+        "trim_trailing": trim_trailing,
+        "min_frames": min_frames,
+        "max_trim_ratio": max_trim_ratio,
+        "frames_before": frames_before,
+        "frames_after": frames_after,
+        "frames_dropped": frames_before - frames_after,
+        "kept_pct": kept_pct,
+        "drop_lead_mean": float(lead_drops.mean()),
+        "drop_lead_p50": float(np.median(lead_drops)),
+        "drop_lead_p90": float(np.percentile(lead_drops, 90)),
+        "drop_lead_max": int(lead_drops.max()) if len(lead_drops) else 0,
+        "drop_trail_mean": float(trail_drops.mean()),
+        "drop_trail_p50": float(np.median(trail_drops)),
+        "drop_trail_p90": float(np.percentile(trail_drops, 90)),
+        "drop_trail_max": int(trail_drops.max()) if len(trail_drops) else 0,
+        "kept_mean": float(kept.mean()),
+        "unchanged": int(np.sum((lead_drops == 0) & (trail_drops == 0))),
+        "plans": plans if dry_run else None,
+    }
+
+    def _fmt_frames(n: float) -> str:
+        return f"{n:.0f} frames ({n / fps:.2f}s)"
+
+    logger.info("========== trim-static-frames plan%s ==========", " (dry-run)" if dry_run else "")
+    logger.info(
+        "config: feature=%s threshold=%.4g window=%d leading=%s trailing=%s "
+        "min_frames=%d max_trim_ratio=%.2f fps=%.0f",
+        feature, threshold, window, trim_leading, trim_trailing,
+        min_frames, max_trim_ratio, fps,
+    )
+    logger.info(
+        "dataset: %d episode(s), frames %d -> %d (drop %d, keep %.1f%%)",
+        summary["episodes"], frames_before, frames_after,
+        summary["frames_dropped"], kept_pct,
+    )
+    logger.info(
+        "leading drop:  p50=%s  p90=%s  mean=%s  max=%s",
+        _fmt_frames(summary["drop_lead_p50"]),
+        _fmt_frames(summary["drop_lead_p90"]),
+        _fmt_frames(summary["drop_lead_mean"]),
+        _fmt_frames(summary["drop_lead_max"]),
+    )
+    logger.info(
+        "trailing drop: p50=%s  p90=%s  mean=%s  max=%s",
+        _fmt_frames(summary["drop_trail_p50"]),
+        _fmt_frames(summary["drop_trail_p90"]),
+        _fmt_frames(summary["drop_trail_mean"]),
+        _fmt_frames(summary["drop_trail_max"]),
+    )
+    logger.info(
+        "unchanged episodes (no trim): %d / %d",
+        summary["unchanged"], summary["episodes"],
+    )
+
+    # Per-episode detail: all if small; otherwise top drops + a few zeros.
+    max_detail = 30 if dry_run else 10
+    ranked = sorted(plans, key=lambda p: (p["drop_lead"] + p["drop_trail"]), reverse=True)
+    show = ranked if len(ranked) <= max_detail else ranked[:max_detail]
+    logger.info(
+        "per-episode detail (%s):",
+        f"all {len(show)}" if len(ranked) <= max_detail
+        else f"top {max_detail}/{len(ranked)} by total drop",
+    )
+    logger.info(
+        "  %-6s %8s %8s %8s %8s %8s %10s",
+        "ep", "length", "lead", "trail", "kept", "start", "end",
+    )
+    for p in show:
+        logger.info(
+            "  %-6d %8d %8d %8d %8d %8d %10d   # keep [%d, %d)  "
+            "drop_lead=%.2fs drop_trail=%.2fs",
+            p["episode_index"],
+            p["length"],
+            p["drop_lead"],
+            p["drop_trail"],
+            p["kept"],
+            p["start"],
+            p["end"],
+            p["start"],
+            p["end"],
+            p["drop_lead"] / fps,
+            p["drop_trail"] / fps,
+        )
+    if len(ranked) > max_detail:
+        logger.info(
+            "  ... %d more episode(s) omitted; re-run with a smaller subset "
+            "or inspect returned dry-run['plans'] in Python.",
+            len(ranked) - max_detail,
+        )
+    logger.info("================================================")
+
+    if dry_run:
+        return summary
+
+    # Resolve codec from first video if not overridden.
+    if video_keys and video_path_template is not None:
+        if codec is None:
+            first_vid = src / _format_video_path(
+                all_eps[0], chunks_size, video_path_template, video_keys[0]
+            )
+            probed = get_video_info(first_vid)
+            src_codec = probed.get("video.codec", "h264")
+            codec = src_codec if src_codec in _REENCODE_CODECS else "h264"
+            logger.info("Using video codec %r (from source probe %r).", codec, src_codec)
+        encoder, canonical = _resolve_reencode_codec(codec)
+    else:
+        encoder, canonical = "h264", "h264"
+
+    if workers is None:
+        workers = max(1, os.cpu_count() or 1)
+    workers = max(1, int(workers))
+    per_job_threads = 1 if workers > 1 else None
+
+    # Resolve output dir.
+    if in_place:
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        backup = src.parent / f"{src.name}_backup_{ts}"
+        if backup.exists():
+            raise FileExistsError(f"Backup path already exists: {backup}")
+        output_root = src
+        shutil.move(str(src), str(backup))
+        source_dir = backup
+        logger.info("Moved original dataset to backup: %s", backup)
+    else:
+        output_root = Path(output).expanduser().resolve()  # type: ignore[arg-type]
+        if output_root.exists() and any(output_root.iterdir()):
+            raise FileExistsError(
+                f"Output directory {output_root} already exists and is not empty."
+            )
+        if output_root == src:
+            raise ValueError("Output path must not equal input path (use --in-place instead).")
+        source_dir = src
+
+    out_info = copy.deepcopy(meta.info)
+    out_info["repo_id"] = repo_id if repo_id is not None else meta.repo_id
+    out_info["total_episodes"] = 0
+    out_info["total_frames"] = 0
+    out_info["total_videos"] = 0
+    out_info["total_chunks"] = 0
+    out_info["splits"] = {}
+
+    output_root.mkdir(parents=True, exist_ok=True)
+    (output_root / "meta").mkdir(parents=True, exist_ok=True)
+
+    src_tasks_path = source_dir / TASKS_PATH
+    if src_tasks_path.is_file():
+        shutil.copy2(src_tasks_path, output_root / TASKS_PATH)
+
+    src_episodes_stats = (
+        load_episodes_stats(source_dir) if (source_dir / EPISODES_STATS_PATH).is_file() else {}
+    )
+    episodes_out_path = output_root / EPISODES_PATH
+    episodes_stats_out_path = output_root / EPISODES_STATS_PATH
+    all_episode_stats: list[dict] = []
+
+    next_global_frame = 0
+    video_jobs: list[tuple] = []
+
+    pbar = tqdm(total=len(plans), unit="ep", desc="trim-static", dynamic_ncols=True)
+    try:
+        for plan in plans:
+            ep_idx = plan["episode_index"]
+            start, end = plan["start"], plan["end"]
+            ep_dict = meta.episodes[ep_idx]
+            ep_task_strs = ep_dict.get("tasks", [])
+
+            src_pq = source_dir / _format_parquet_path(ep_idx, chunks_size, data_path_template)
+            dst_pq = output_root / _format_parquet_path(ep_idx, chunks_size, data_path_template)
+            length = _rewrite_trimmed_parquet(
+                src_pq, dst_pq, start, end,
+                new_episode_index=ep_idx,
+                new_index_start=next_global_frame,
+                fps=fps,
+            )
+
+            if video_path_template is not None:
+                for vid_key in video_keys:
+                    src_vid = source_dir / _format_video_path(
+                        ep_idx, chunks_size, video_path_template, vid_key
+                    )
+                    if not src_vid.is_file():
+                        raise FileNotFoundError(
+                            f"Video missing for episode {ep_idx} key {vid_key}: {src_vid}"
+                        )
+                    dst_vid = output_root / _format_video_path(
+                        ep_idx, chunks_size, video_path_template, vid_key
+                    )
+                    if start == 0 and end == plan["length"]:
+                        dst_vid.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(src_vid, dst_vid)
+                    else:
+                        video_jobs.append(
+                            (
+                                str(src_vid),
+                                str(dst_vid),
+                                start,
+                                end,
+                                encoder,
+                                pix_fmt,
+                                crf,
+                                preset,
+                                per_job_threads,
+                            )
+                        )
+
+            append_jsonlines(
+                {"episode_index": ep_idx, "tasks": list(ep_task_strs), "length": length},
+                episodes_out_path,
+            )
+
+            old_stats = src_episodes_stats.get(ep_idx)
+            ep_stats = _recompute_episode_stats_from_parquet(
+                dst_pq, features, old_ep_stats=old_stats
+            )
+            append_jsonlines(
+                {"episode_index": ep_idx, "stats": serialize_dict(ep_stats)},
+                episodes_stats_out_path,
+            )
+            all_episode_stats.append(ep_stats)
+
+            next_global_frame += length
+            out_info["total_episodes"] += 1
+            out_info["total_frames"] += length
+            out_info["total_videos"] += len(video_keys)
+            chunk_now = _episode_chunk(ep_idx, chunks_size)
+            if chunk_now + 1 > out_info["total_chunks"]:
+                out_info["total_chunks"] = chunk_now + 1
+            out_info["splits"] = {"train": f"0:{out_info['total_episodes']}"}
+
+            pbar.set_postfix(lead=plan["drop_lead"], trail=plan["drop_trail"], kept=length)
+            pbar.update(1)
+    finally:
+        pbar.close()
+
+    if video_jobs:
+        logger.info("Trimming/re-encoding %d video(s) with workers=%d.", len(video_jobs), workers)
+        vbar = tqdm(total=len(video_jobs), unit="vid", desc="trim-videos", dynamic_ncols=True)
+        try:
+            if workers == 1:
+                for job in video_jobs:
+                    _trim_video_worker(*job)
+                    vbar.update(1)
+            else:
+                with ProcessPoolExecutor(max_workers=workers) as pool:
+                    futures = [pool.submit(_trim_video_worker, *job) for job in video_jobs]
+                    for fut in as_completed(futures):
+                        fut.result()
+                        vbar.update(1)
+        finally:
+            vbar.close()
+
+    # Refresh video meta from episode 0 if we re-encoded anything.
+    if video_keys and video_path_template is not None and video_jobs:
+        first_ep = all_eps[0]
+        for vid_key in video_keys:
+            dst_vid = output_root / _format_video_path(
+                first_ep, chunks_size, video_path_template, vid_key
+            )
+            probed = get_video_info(dst_vid)
+            if probed:
+                _update_video_feature_info(out_info["features"][vid_key], probed)
+
+    write_json(out_info, output_root / INFO_PATH)
+    if all_episode_stats:
+        write_stats(aggregate_stats(all_episode_stats), output_root)
+    else:
+        logger.warning("No episode stats produced; skipping stats.json.")
+
+    _consistency_check(output_root, out_info, video_keys, video_path_template)
+    logger.info(
+        "Trim-static complete: '%s' frames %d -> %d. Output: %s",
+        meta.repo_id, summary["frames_before"], out_info["total_frames"], output_root,
+    )
+    return output_root
+
+
+# =====================================================================================
 # CLI
 # =====================================================================================
 def _add_merge_parser(subparsers) -> None:
@@ -2393,13 +3056,151 @@ def _cmd_reencode_videos(args: argparse.Namespace) -> int:
     return 0
 
 
+def _add_trim_static_frames_parser(subparsers) -> None:
+    p = subparsers.add_parser(
+        "trim-static-frames",
+        help="Trim leading/trailing near-static frames (sync parquet + videos).",
+        description=(
+            "Detect near-static borders via L2 deltas of a float vector feature "
+            "(default: action), then slice parquet rows and re-encode videos to the "
+            "same [start, end) range. Rewrites frame_index/timestamp/index and "
+            "recomputes stats. Use --dry-run to only print the trim plan."
+        ),
+    )
+    p.add_argument(
+        "--input",
+        required=True,
+        help="Source dataset root directory (contains meta/info.json).",
+    )
+    p.add_argument(
+        "--feature",
+        default="action",
+        help="Float vector feature used for motion detection (default: action).",
+    )
+    p.add_argument(
+        "--threshold",
+        type=float,
+        default=0.005,
+        help=(
+            "L2 delta below this counts as static (default: 0.005). "
+            "Raise to trim more aggressively."
+        ),
+    )
+    p.add_argument(
+        "--window",
+        type=int,
+        default=1,
+        help="Moving-average window over deltas (default: 1 = raw per-step).",
+    )
+    p.add_argument(
+        "--no-leading",
+        action="store_true",
+        help="Do not trim leading static frames.",
+    )
+    p.add_argument(
+        "--no-trailing",
+        action="store_true",
+        help="Do not trim trailing static frames.",
+    )
+    p.add_argument(
+        "--min-frames",
+        type=int,
+        default=30,
+        help="Minimum frames to keep per episode (default: 30).",
+    )
+    p.add_argument(
+        "--max-trim-ratio",
+        type=float,
+        default=0.8,
+        help="Max fraction of an episode that may be dropped (default: 0.8).",
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Only compute/print the trim plan; do not write output.",
+    )
+    p.add_argument(
+        "--codec",
+        default=None,
+        help="Video re-encode codec override (default: probe from source).",
+    )
+    p.add_argument(
+        "--pix-fmt",
+        default="yuv420p",
+        help="Pixel format for re-encode (default: yuv420p).",
+    )
+    p.add_argument(
+        "--crf",
+        type=int,
+        default=23,
+        help="Encoder CRF (default: 23).",
+    )
+    p.add_argument(
+        "--preset",
+        default="veryfast",
+        help="Encoder preset (default: veryfast).",
+    )
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Parallel video workers (default: CPU count).",
+    )
+    out_group = p.add_mutually_exclusive_group(required=False)
+    out_group.add_argument(
+        "--output",
+        default=None,
+        help="Destination directory for the result (must not exist or be empty).",
+    )
+    out_group.add_argument(
+        "--in-place",
+        action="store_true",
+        help=(
+            "Write the result back into --input. The original is first moved aside to "
+            "<input>_backup_<timestamp> for reversibility."
+        ),
+    )
+    p.add_argument(
+        "--repo-id",
+        default=None,
+        help="repo_id recorded in the output info.json (default: keep source repo_id).",
+    )
+    p.set_defaults(func=_cmd_trim_static_frames)
+
+
+def _cmd_trim_static_frames(args: argparse.Namespace) -> int:
+    if not args.dry_run and not args.in_place and args.output is None:
+        raise SystemExit("Either --output, --in-place, or --dry-run must be specified.")
+    trim_static_frames(
+        input=args.input,
+        output=args.output,
+        repo_id=args.repo_id,
+        in_place=args.in_place,
+        feature=args.feature,
+        threshold=args.threshold,
+        trim_leading=not args.no_leading,
+        trim_trailing=not args.no_trailing,
+        window=args.window,
+        min_frames=args.min_frames,
+        max_trim_ratio=args.max_trim_ratio,
+        dry_run=args.dry_run,
+        codec=args.codec,
+        pix_fmt=args.pix_fmt,
+        crf=args.crf,
+        preset=args.preset,
+        workers=args.workers,
+    )
+    return 0
+
+
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="lerobot-edit-dataset",
         description=(
             "Edit LeRobot datasets (format v2.1). "
             "Sub-commands: merge, delete-episodes, rename-cameras, "
-            "transform-features, delete-features, reencode-videos."
+            "transform-features, delete-features, reencode-videos, "
+            "trim-static-frames."
         ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True, metavar="<command>")
@@ -2409,6 +3210,7 @@ def make_parser() -> argparse.ArgumentParser:
     _add_transform_features_parser(subparsers)
     _add_delete_features_parser(subparsers)
     _add_reencode_videos_parser(subparsers)
+    _add_trim_static_frames_parser(subparsers)
     return parser
 
 
